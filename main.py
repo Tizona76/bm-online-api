@@ -1,3 +1,8 @@
+# (modifie la ligne VALUES comme ci-dessus)
+python3 -m py_compile main.py
+git add main.py
+git commit -m "Fix submit SQL binds to SQLAlchemy named params"
+git push
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Any, Dict
@@ -166,7 +171,7 @@ def lb_season_submit(p: LBSubmitPayload):
         INSERT INTO leaderboard_season
         (season_id, profile_uuid, pseudo, club, club_level, titles_total, winrate, score_final, meta_json, client_sig, updated_at)
         VALUES
-        (%(season_id)s, %(profile_uuid)s, %(pseudo)s, %(club)s, %(club_level)s, %(titles_total)s, %(winrate)s, %(score_final)s, %(meta_json)s::jsonb, %(client_sig)s, NOW())
+        (:season_id, :profile_uuid, :pseudo, :club, :club_level, :titles_total, :winrate, :score_final, CAST(:meta_json AS jsonb), :client_sig, NOW())
         ON CONFLICT (season_id, profile_uuid)
         DO UPDATE SET
             pseudo = EXCLUDED.pseudo,
