@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
+from typing import Any, Dict
 import json
 import time
 import hashlib
@@ -158,7 +159,8 @@ def lb_season_submit(p: LBSubmitPayload):
         raise HTTPException(status_code=503, detail="LEADERBOARD_DB_NOT_READY")
 
     import json
-    meta_json = json.dumps(p.meta.model_dump())
+    meta_json = json.dumps(p.meta.model_dump() if hasattr(p.meta, "model_dump") else (p.meta or {}))
+
 
     q = text("""
         INSERT INTO leaderboard_season
@@ -178,7 +180,7 @@ def lb_season_submit(p: LBSubmitPayload):
             updated_at = NOW()
         RETURNING updated_at;
     """)
-
+    
     with eng.begin() as conn:
         row = conn.execute(q, {
             "season_id": p.season_id,
