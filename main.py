@@ -40,8 +40,15 @@ def _lb_get_engine() -> Optional[Engine]:
             db_url = db_url.replace("postgres://", "postgresql://", 1)
         _LB_ENGINE = create_engine(db_url, pool_pre_ping=True)
         return _LB_ENGINE
-    except Exception:
+    except Exception as e:
+        try:
+            print("[DBG][LB] _lb_get_engine FAIL:", repr(e))
+            du = (os.environ.get("DATABASE_URL", "") or "").strip()
+            print("[DBG][LB] DATABASE_URL len =", len(du), "starts=", du[:30])
+        except Exception:
+            pass
         return None
+
 
 def _lb_init_schema() -> bool:
     """Crée la table si besoin. Ne casse jamais le serveur Cloud."""
