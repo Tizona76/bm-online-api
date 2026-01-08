@@ -1,8 +1,3 @@
-# (modifie la ligne VALUES comme ci-dessus)
-python3 -m py_compile main.py
-git add main.py
-git commit -m "Fix submit SQL binds to SQLAlchemy named params"
-git push
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Any, Dict
@@ -22,6 +17,12 @@ def root():
 @app.get("/v1/health")
 def health():
     return {"ok": True}
+
+# Alias demandé
+@app.get("/health")
+def health_root():
+    return {"ok": True}
+
 
 # ============================================================
 # LEADERBOARD (Postgres) — V1 saison mensuelle
@@ -67,35 +68,52 @@ def _lb_init_schema() -> bool:
     if eng is None:
         return False
     try:
-        ddl = """
-        CREATE TABLE IF NOT EXISTS leaderboard_season (
-          season_id       TEXT NOT NULL,
-          profile_uuid    TEXT NOT NULL,
-          pseudo          TEXT NOT NULL,
-          club            TEXT NOT NULL,
-          club_level      INT  NOT NULL DEFAULT 1,
-          titles_total    INT  NOT NULL DEFAULT 0,
-          winrate         DOUBLE PRECISION NOT NULL DEFAULT 0,
-          score_final     INT  NOT NULL DEFAULT 0,
-          meta_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
-          client_sig      TEXT NOT NULL DEFAULT '',
-          updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT leaderboard_season_pk PRIMARY KEY (season_id, profile_uuid)
-        );
-        CREATE INDEX IF NOT EXISTS lb_season_score_idx
-          ON leaderboard_season (season_id, score_final DESC, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS lb_season_winrate_idx
-          ON leaderboard_season (season_id, winrate DESC, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS lb_season_titles_idx
-          ON leaderboard_season (season_id, titles_total DESC, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS lb_season_level_idx
-          ON leaderboard_season (season_id, club_level DESC, updated_at DESC);
-        """
+        stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS leaderboard_season (
+              season_id       TEXT NOT NULL,
+              profile_uuid    TEXT NOT NULL,
+              pseudo          TEXT NOT NULL,
+              club            TEXT NOT NULL,
+              club_level      INT  NOT NULL DEFAULT 1,
+              titles_total    INT  NOT NULL DEFAULT 0,
+              winrate         DOUBLE PRECISION NOT NULL DEFAULT 0,
+              score_final     INT  NOT NULL DEFAULT 0,
+              meta_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+              client_sig      TEXT NOT NULL DEFAULT '',
+              updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              CONSTRAINT leaderboard_season_pk PRIMARY KEY (season_id, profile_uuid)
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS lb_season_score_idx
+              ON leaderboard_season (season_id, score_final DESC, updated_at DESC);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS lb_season_winrate_idx
+              ON leaderboard_season (season_id, winrate DESC, updated_at DESC);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS lb_season_titles_idx
+              ON leaderboard_season (season_id, titles_total DESC, updated_at DESC);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS lb_season_level_idx
+              ON leaderboard_season (season_id, club_level DESC, updated_at DESC);
+            """,
+        ]
+
         with eng.begin() as conn:
-            conn.execute(text(ddl))
+            for s in stmts:
+                conn.execute(text(s))
         return True
-    except Exception:
+    except Exception as e:
+        try:
+            print("[DBG][LB] _lb_init_schema FAIL:", repr(e))
+        except Exception:
+            pass
         return False
+
 
 def _lb_sig_v1(season_id: str, profile_uuid: str, pseudo: str, club: str,
               club_level: int, titles_total: int, winrate: float, score_final: int) -> str:
@@ -141,6 +159,7 @@ class LBSubmitPayload(BaseModel):
     client_sig: Optional[str] = ""
 
 @app.post("/v1/leaderboard/season/submit")
+
 def lb_season_submit(p: LBSubmitPayload):
     if not _lb_init_schema():
         raise HTTPException(status_code=503, detail="LEADERBOARD_DB_NOT_READY")
@@ -186,28 +205,36 @@ def lb_season_submit(p: LBSubmitPayload):
         RETURNING updated_at;
     """)
     
-    with eng.begin() as conn:
-        params = {
-            "season_id": p.season_id,
-            "profile_uuid": p.profile_uuid,
-            "pseudo": (p.pseudo or "")[:24],
-            "club": (p.club or "")[:24],
-            "club_level": int(p.club_level),
-            "titles_total": int(p.titles_total),
-            "winrate": float(p.winrate),
-            "score_final": int(p.score_final),
-            "meta_json": meta_json,
-            "client_sig": (p.client_sig or "")[:128],
-        }
+    try:
+        with eng.begin() as conn:
+            params = {
+                "season_id": p.season_id,
+                "profile_uuid": p.profile_uuid,
+                "pseudo": (p.pseudo or "")[:24],
+                "club": (p.club or "")[:24],
+                "club_level": int(p.club_level),
+                "titles_total": int(p.titles_total),
+                "winrate": float(p.winrate),
+                "score_final": int(p.score_final),
+                "meta_json": meta_json,
+                "client_sig": (p.client_sig or "")[:128],
+            }
 
-        # --- Debug preuve (temporaire) ---
+            # --- Debug preuve (temporaire) ---
+            try:
+                print("[DBG][LB][SUBMIT] params keys =", sorted(list(params.keys())))
+                print("[DBG][LB][SUBMIT] meta_json len =", len(meta_json or ""))
+            except Exception:
+                pass
+
+            row = conn.execute(q, params).fetchone()
+
+    except Exception as e:
         try:
-            print("[DBG][LB][SUBMIT] params keys =", sorted(list(params.keys())))
-            print("[DBG][LB][SUBMIT] meta_json len =", len(meta_json or ""))
+            print("[DBG][LB][SUBMIT] SQL FAIL:", repr(e))
         except Exception:
             pass
-
-        row = conn.execute(q, params).fetchone()
+        raise HTTPException(status_code=503, detail="LEADERBOARD_DB_ERROR")
 
     return {
         "ok": True,
@@ -217,7 +244,9 @@ def lb_season_submit(p: LBSubmitPayload):
     }
 
 
+
 @app.get("/v1/leaderboard/season/top")
+
 def lb_season_top(season_id: str, metric: str = "score_final", limit: int = 50, offset: int = 0):
     if not _lb_init_schema():
         raise HTTPException(status_code=503, detail="LEADERBOARD_DB_NOT_READY")
