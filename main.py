@@ -182,7 +182,7 @@ def lb_season_submit(p: LBSubmitPayload):
     """)
     
     with eng.begin() as conn:
-        row = conn.execute(q, {
+        params = {
             "season_id": p.season_id,
             "profile_uuid": p.profile_uuid,
             "pseudo": (p.pseudo or "")[:24],
@@ -193,9 +193,24 @@ def lb_season_submit(p: LBSubmitPayload):
             "score_final": int(p.score_final),
             "meta_json": meta_json,
             "client_sig": (p.client_sig or "")[:128],
-        }).fetchone()
+        }
 
-    return {"ok": True, "season_id": p.season_id, "profile_uuid": p.profile_uuid, "updated_at": str(row[0]) if row else None}
+        # --- Debug preuve (temporaire) ---
+        try:
+            print("[DBG][LB][SUBMIT] params keys =", sorted(list(params.keys())))
+            print("[DBG][LB][SUBMIT] meta_json len =", len(meta_json or ""))
+        except Exception:
+            pass
+
+        row = conn.execute(q, params).fetchone()
+
+    return {
+        "ok": True,
+        "season_id": p.season_id,
+        "profile_uuid": p.profile_uuid,
+        "updated_at": str(row[0]) if row else None
+    }
+
 
 @app.get("/v1/leaderboard/season/top")
 def lb_season_top(season_id: str, metric: str = "score_final", limit: int = 50, offset: int = 0):
