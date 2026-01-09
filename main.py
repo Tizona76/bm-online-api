@@ -2,13 +2,11 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Any, Dict
 import json
-import time
 import hashlib
-import sqlite3
-import threading
 
 
-app = FastAPI(title="BM Online API", version="0.0.1")
+app = FastAPI(title="BM Online API", version="0.0.2-cloudtest")
+
 
 @app.get("/")
 def root():
@@ -114,6 +112,29 @@ def _lb_init_schema() -> bool:
             pass
         return False
 
+def _cloud_init_schema() -> bool:
+    eng = _lb_get_engine()
+    if eng is None:
+        return False
+    try:
+        with eng.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS cloud_save (
+              profile_uuid TEXT PRIMARY KEY,
+              blob_json    JSONB NOT NULL DEFAULT '{}'::jsonb,
+              client_sig   TEXT NOT NULL DEFAULT '',
+              updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """))
+        return True
+    except Exception as e:
+        try:
+            print("[DBG][CLOUD] _cloud_init_schema FAIL:", repr(e))
+        except Exception:
+            pass
+        return False
+
+
 
 def _lb_sig_v1(season_id: str, profile_uuid: str, pseudo: str, club: str,
               club_level: int, titles_total: int, winrate: float, score_final: int) -> str:
@@ -134,6 +155,16 @@ def _lb_sig_v1(season_id: str, profile_uuid: str, pseudo: str, club: str,
         return hashlib.sha256((canon + "|" + salt).encode("utf-8")).hexdigest()
     except Exception:
         return ""
+
+def _cloud_sig_v1(profile_uuid: str, blob: Dict[str, Any]) -> str:
+    """Signature Cloud V1. Si API_SALT_V1 absent => non vérifiée."""
+    try:
+        salt = (os.environ.get("API_SALT_V1", "") or "").strip()
+        canon_blob = json.dumps(blob or {}, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256((str(profile_uuid) + "|" + canon_blob + "|" + salt).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
 
 # ============================================================
 # LEADERBOARD — Endpoints Postgres (V1)
@@ -158,8 +189,13 @@ class LBSubmitPayload(BaseModel):
     meta: LBMeta = LBMeta()
     client_sig: Optional[str] = ""
 
-@app.post("/v1/leaderboard/season/submit")
 
+class CloudSavePayload(BaseModel):
+    profile_uuid: str
+    blob: Dict[str, Any]  # snapshot JSON du profil (ou tout le save)
+    client_sig: Optional[str] = ""
+
+@app.post("/v1/leaderboard/season/submit")
 def lb_season_submit(p: LBSubmitPayload):
     if not _lb_init_schema():
         raise HTTPException(status_code=503, detail="LEADERBOARD_DB_NOT_READY")
@@ -336,4 +372,78 @@ def lb_season_me(season_id: str, profile_uuid: str, metric: str = "score_final")
         "updated_at": str(r[7]),
     }
     return {"ok": True, "season_id": season_id, "metric": metric, "me": me}
+
+@app.post("/v1/cloud/save")
+def cloud_save(p: CloudSavePayload):
+    if not _cloud_init_schema():
+        raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
+
+    if not p.profile_uuid or len(p.profile_uuid) < 16:
+        raise HTTPException(status_code=400, detail="BAD_PROFILE_UUID")
+
+    salt = (os.environ.get("API_SALT_V1", "") or "").strip()
+    if salt:
+        expected = _cloud_sig_v1(p.profile_uuid, p.blob)
+        if (p.client_sig or "") != expected:
+            raise HTTPException(status_code=400, detail="BAD_SIGNATURE")
+
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
+
+    blob_json = json.dumps(p.blob or {}, separators=(",", ":"), ensure_ascii=False)
+
+    q = text("""
+        INSERT INTO cloud_save (profile_uuid, blob_json, client_sig, updated_at)
+        VALUES (:profile_uuid, CAST(:blob_json AS jsonb), :client_sig, NOW())
+        ON CONFLICT (profile_uuid)
+        DO UPDATE SET
+            blob_json = EXCLUDED.blob_json,
+            client_sig = EXCLUDED.client_sig,
+            updated_at = NOW()
+        RETURNING updated_at;
+    """)
+
+    try:
+        with eng.begin() as conn:
+            row = conn.execute(q, {
+                "profile_uuid": p.profile_uuid,
+                "blob_json": blob_json,
+                "client_sig": (p.client_sig or "")[:128],
+            }).fetchone()
+    except Exception as e:
+        try:
+            print("[DBG][CLOUD][SAVE] SQL FAIL:", repr(e))
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="CLOUD_DB_ERROR")
+
+    return {"ok": True, "profile_uuid": p.profile_uuid, "updated_at": str(row[0]) if row else None}
+
+@app.get("/v1/cloud/load")
+def cloud_load(profile_uuid: str, client_sig: str = ""):
+    if not _cloud_init_schema():
+        raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
+
+    if not profile_uuid or len(profile_uuid) < 16:
+        raise HTTPException(status_code=400, detail="BAD_PROFILE_UUID")
+
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
+
+    q = text("SELECT blob_json, updated_at FROM cloud_save WHERE profile_uuid = :profile_uuid LIMIT 1;")
+
+    with eng.begin() as conn:
+        r = conn.execute(q, {"profile_uuid": profile_uuid}).fetchone()
+
+    if not r:
+        return {"ok": True, "profile_uuid": profile_uuid, "found": False, "blob": None}
+
+    blob = r[0]
+    updated_at = r[1]
+
+    # (Optionnel) vérif signature côté load : seulement si tu veux que le client prouve qu’il connaît le salt,
+    # sinon laisse ouvert (lecture publique) — à décider.
+    return {"ok": True, "profile_uuid": profile_uuid, "found": True, "blob": blob, "updated_at": str(updated_at)}
 
