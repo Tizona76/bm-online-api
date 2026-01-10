@@ -6,3 +6,6 @@ __pycache__
 
 # local backups
 *.BACKUP_*
+
+# local backups
+*.BACKUP_*
