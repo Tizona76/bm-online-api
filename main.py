@@ -276,17 +276,57 @@ def _refresh_expires_at() -> datetime:
     return _utcnow() + timedelta(days=REFRESH_TOKEN_DAYS)
 
 
-# -------- Email sender (SMTP / mock) --------
+# -------- Email sender (SMTP / mock / resend) --------
 def _send_otp_email(to_email: str, code: str) -> None:
+    # 1) mock
     if EMAIL_MODE == "mock":
         print(f"[MOCK_EMAIL] OTP for {to_email} = {code}")
         return
 
+    subject = "Basket Manager — Code de connexion"
+    body = f"Votre code Basket Manager est : {code}\n\nIl expire dans {OTP_TTL_MINUTES} minutes."
+
+    # 2) resend
+    if EMAIL_MODE == "resend":
+        resend_key = os.environ.get("RESEND_API_KEY", "").strip()
+        resend_from = os.environ.get("RESEND_FROM", "").strip()
+
+        if not (resend_key and resend_from):
+            raise HTTPException(status_code=503, detail="RESEND_NOT_CONFIGURED")
+
+        try:
+            import json
+            import urllib.request
+
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=json.dumps({
+                    "from": resend_from,
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": body,
+                }).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {resend_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read() or b"{}"
+
+            # si Resend renvoie une erreur, on la propage clairement
+            # (Resend renvoie souvent 200/201 en succès)
+            return
+
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"RESEND_FAIL:{e}")
+
+    # 3) smtp (fallback)
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_FROM):
         raise HTTPException(status_code=503, detail="SMTP_NOT_CONFIGURED")
 
-    subject = "Basket Manager — Code de connexion"
-    body = f"Votre code Basket Manager est : {code}\n\nIl expire dans {OTP_TTL_MINUTES} minutes."
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
@@ -296,6 +336,7 @@ def _send_otp_email(to_email: str, code: str) -> None:
         s.starttls()
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(EMAIL_FROM, [to_email], msg.as_string())
+
 
 
 # -------- Anti-abus (in-memory soft) --------
