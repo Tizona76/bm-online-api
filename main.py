@@ -7,6 +7,10 @@ import os
 import time
 import uuid
 import secrets
+import urllib.request
+import urllib.error
+
+
 from datetime import datetime, timedelta, timezone
 
 # JWT (python-jose)
@@ -37,7 +41,40 @@ def debug_resend_env():
     }
 
 
-import os
+@app.post("/debug/resend_send")
+async def debug_resend_send(request: Request):
+    debug_key = (os.getenv("BM_DEBUG_KEY", "") or "").strip()
+    got = (request.headers.get("X-Debug-Key", "") or "").strip()
+    if not debug_key or got != debug_key:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    payload = await request.json()
+    to_email = (payload.get("to") or "").strip()
+    subject = (payload.get("subject") or "BM debug send").strip()
+    text = (payload.get("text") or "Hello").strip()
+
+    api_key = (os.getenv("RESEND_API_KEY", "") or "").strip()
+    from_addr = (os.getenv("RESEND_FROM", "") or "").strip()
+
+    if not api_key or not from_addr:
+        return {"ok": False, "error": "MISSING_RESEND_ENV", "has_key": bool(api_key), "has_from": bool(from_addr)}
+    if not to_email:
+        return {"ok": False, "error": "MISSING_TO"}
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps({"from": from_addr, "to": [to_email], "subject": subject, "text": text}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return {"ok": True, "status": resp.status, "body": body}
+    except Exception as e:
+        return {"ok": False, "status": 0, "body": repr(e)}
+
+
 
 @app.get("/v1/debug/salt_len")
 def debug_salt_len():
