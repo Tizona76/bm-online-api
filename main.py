@@ -48,7 +48,13 @@ async def debug_resend_send(request: Request):
     if not debug_key or got != debug_key:
         raise HTTPException(status_code=404, detail="Not Found")
 
-    payload = await request.json()
+    payload = {}
+    try:
+        raw = await request.body()
+        if raw and raw.strip():
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        payload = {}
     to_email = (payload.get("to") or "").strip()
     subject = (payload.get("subject") or "BM debug send").strip()
     text = (payload.get("text") or "Hello").strip()
