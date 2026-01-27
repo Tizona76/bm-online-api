@@ -13,6 +13,34 @@ import urllib.error
 
 from datetime import datetime, timedelta, timezone
 
+
+import json
+from typing import Any, Dict, Tuple, Optional
+
+async def safe_body_json(request) -> Tuple[Dict[str, Any], bytes]:
+    """
+    Parse JSON depuis le body sans lever JSONDecodeError.
+    - Retourne (data_dict, raw_bytes)
+    - Si body vide -> ({}, b"")
+    - Si JSON invalide -> ({"_error":"JSON_INVALID", "_raw":"..."}, raw_bytes)
+    """
+    try:
+        raw = await request.body()
+    except Exception as e:
+        return ({"_error": "BODY_READ_FAIL", "exc": repr(e)}, b"")
+
+    if not raw:
+        return ({}, b"")
+
+    try:
+        txt = raw.decode("utf-8", errors="replace")
+        data = json.loads(txt)
+        if isinstance(data, dict):
+            return (data, raw)
+        # Si le JSON est une liste / string etc, on l'encapsule pour debug
+        return ({"_json": data}, raw)
+    except Exception as e:
+        return ({"_error": "JSON_INVALID", "exc": repr(e), "_raw": raw.decode("utf-8", errors="replace")}, raw)
 # JWT (python-jose)
 from jose import jwt
 from jose.exceptions import JWTError
@@ -39,46 +67,87 @@ def debug_resend_env():
         "from": frm,
         "email_mode": mode,
     }
-
-
 @app.post("/debug/resend_send")
-async def debug_resend_send(request: Request):
-    debug_key = (os.getenv("BM_DEBUG_KEY", "") or "").strip()
-    got = (request.headers.get("X-Debug-Key", "") or "").strip()
-    if not debug_key or got != debug_key:
-        raise HTTPException(status_code=404, detail="Not Found")
+async def debug_resend_send(request):
+    """
+    DEBUG endpoint: envoie un email via Resend.
+    Objectifs:
+    - Ne JAMAIS appeler request.json() (évite JSONDecodeError si body vide)
+    - Parser le body de manière safe
+    - En cas de 403 Resend, renvoyer status + body Resend via HTTPError.read()
+    """
+    data, raw = await safe_body_json(request)
 
-    payload = {}
+    # Champs attendus (à adapter si tu veux)
+    to = str(data.get("to", "") or "")
+    subject = str(data.get("subject", "BM Debug Resend") or "BM Debug Resend")
+    text = str(data.get("text", "Hello from /debug/resend_send") or "Hello from /debug/resend_send")
+
+    # Petits indices utiles côté diagnostic (body vide / JSON invalide / etc.)
+    diag = {
+        "body_len": len(raw),
+        "parsed_keys": list(data.keys()) if isinstance(data, dict) else [],
+        "to_present": bool(to),
+    }
+
+    # Si tu veux autoriser un POST vide juste pour vérifier que ça ne 500 plus:
+    if not to:
+        return {"ok": False, "error": "MISSING_TO", "diag": diag, "received": data}
+
+    import os, json as _json
+    from urllib import request as _ureq
+    from urllib.error import HTTPError, URLError
+
+    api_key = os.environ.get("RESEND_API_KEY", "") or ""
+    if not api_key:
+        return {"ok": False, "error": "NO_RESEND_API_KEY", "diag": diag}
+
+    url = "https://api.resend.com/emails"
+    payload = {
+        # ⚠️ Mets un from valide configuré chez Resend (domaine vérifié)
+        "from": os.environ.get("RESEND_FROM", "BasketManager <no-reply@basketmanager-game.com>"),
+        "to": [to],
+        "subject": subject,
+        "text": text,
+    }
+    body = _json.dumps(payload).encode("utf-8")
+
+    req = _ureq.Request(url, data=body, method="POST")
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+
     try:
-        raw = await request.body()
-        if raw and raw.strip():
-            payload = json.loads(raw.decode("utf-8", errors="replace"))
-    except Exception:
-        payload = {}
-    to_email = (payload.get("to") or "").strip()
-    subject = (payload.get("subject") or "BM debug send").strip()
-    text = (payload.get("text") or "Hello").strip()
+        with _ureq.urlopen(req, timeout=20) as resp:
+            resp_body = resp.read() or b""
+            return {
+                "ok": True,
+                "status": getattr(resp, "status", 200),
+                "body": resp_body.decode("utf-8", errors="replace"),
+                "diag": diag,
+            }
 
-    api_key = (os.getenv("RESEND_API_KEY", "") or "").strip()
-    from_addr = (os.getenv("RESEND_FROM", "") or "").strip()
+    except HTTPError as e:
+        # 🔥 IMPORTANT: body Resend exploitable (notamment sur 403)
+        err_body = b""
+        try:
+            err_body = e.read() or b""
+        except Exception:
+            pass
 
-    if not api_key or not from_addr:
-        return {"ok": False, "error": "MISSING_RESEND_ENV", "has_key": bool(api_key), "has_from": bool(from_addr)}
-    if not to_email:
-        return {"ok": False, "error": "MISSING_TO"}
+        return {
+            "ok": False,
+            "status": int(getattr(e, "code", 0) or 0),
+            "reason": str(getattr(e, "reason", "") or ""),
+            "body": err_body.decode("utf-8", errors="replace"),
+            "diag": diag,
+        }
 
-    req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=json.dumps({"from": from_addr, "to": [to_email], "subject": subject, "text": text}).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return {"ok": True, "status": resp.status, "body": body}
+    except URLError as e:
+        return {"ok": False, "status": 0, "error": "URL_ERROR", "exc": repr(e), "diag": diag}
+
     except Exception as e:
-        return {"ok": False, "status": 0, "body": repr(e)}
+        return {"ok": False, "status": 0, "error": "UNHANDLED", "exc": repr(e), "diag": diag}
 
 
 
