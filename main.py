@@ -68,7 +68,7 @@ def debug_resend_env():
         "email_mode": mode,
     }
 @app.post("/debug/resend_send")
-async def debug_resend_send(request):
+async def debug_resend_send(request: Request):
     """
     DEBUG endpoint: envoie un email via Resend.
     Objectifs:
