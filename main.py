@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, Response
 from pydantic import BaseModel, EmailStr
 from typing import Any, Dict, Optional
 import json
@@ -19,6 +19,23 @@ from email.mime.text import MIMEText
 
 
 app = FastAPI(title="BM Online API", version="0.0.2-cloudtest")
+
+@app.get("/debug/resend_env")
+def debug_resend_env():
+    k = os.getenv("RESEND_API_KEY", "") or ""
+    frm = os.getenv("RESEND_FROM", "") or ""
+    mode = os.getenv("EMAIL_MODE", "") or ""
+    return {
+        "has_key": bool(k),
+        "key_len": len(k),
+        "key_prefix": k[:3],
+        "key_suffix": (k[-4:] if len(k) >= 4 else k),
+        "key_has_space": (" " in k),
+        "key_has_newline": ("\n" in k or "\r" in k),
+        "from": frm,
+        "email_mode": mode,
+    }
+
 
 import os
 
