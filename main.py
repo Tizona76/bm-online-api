@@ -84,7 +84,7 @@ def debug_salt_len():
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "bm-online-api"}
+    return {"ok": True, "service": "bm-online-api", "build": "2026-01-27-debugsend-v3"}
 
 @app.get("/v1/health")
 def health():
