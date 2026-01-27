@@ -116,6 +116,7 @@ async def debug_resend_send(request: Request):
     req.add_header("Authorization", f"Bearer {api_key}")
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
 
     try:
         with _ureq.urlopen(req, timeout=20) as resp:
