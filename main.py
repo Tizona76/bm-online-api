@@ -439,6 +439,7 @@ def _send_otp_email(to_email: str, code: str) -> None:
                 headers={
                     "Authorization": f"Bearer {resend_key}",
                     "Content-Type": "application/json",
+                    "User-Agent": "bm-online-api/1.0",
                 },
                 method="POST",
             )
