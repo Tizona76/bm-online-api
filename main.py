@@ -451,7 +451,14 @@ def _send_otp_email(to_email: str, code: str) -> None:
             return
 
         except Exception as e:
-            raise HTTPException(status_code=503, detail=f"RESEND_FAIL:{e}")
+            resend_body = ""
+            try:
+                if hasattr(e, "read"):
+                    resend_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                resend_body = ""
+
+            raise HTTPException(status_code=503, detail=f"RESEND_FAIL:{e} body={resend_body}")
 
     # 3) smtp (fallback)
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_FROM):
