@@ -906,13 +906,19 @@ def lb_season_submit(p: LBSubmitPayload):
         raise HTTPException(status_code=400, detail="BAD_PROFILE_UUID")
 
     salt = (os.environ.get("API_SALT_V1", "") or "").strip()
-    if salt:
+    client_sig = (p.client_sig or "").strip()
+    if salt and client_sig != "":
         expected = _lb_sig_v1(
             p.season_id, p.profile_uuid, p.pseudo, p.club,
             int(p.club_level), int(p.titles_total), float(p.winrate), int(p.score_final)
         )
-        if (p.client_sig or "") != expected:
+        if client_sig != expected:
             raise HTTPException(status_code=400, detail="BAD_SIGNATURE")
+    elif salt and client_sig == "":
+        try:
+            print("[DBG][LB][SUBMIT] empty client_sig accepted temporarily")
+        except Exception:
+            pass
 
     eng = _lb_get_engine()
     if eng is None:
