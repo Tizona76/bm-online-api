@@ -773,7 +773,7 @@ def auth_verify(p: AuthVerifyPayload, request: Request):
         })
 
     _audit("/v1/auth/verify", 200, user_id=user_id, ip=ip)
-    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer", "profile_uuid": user_id}
 
 
 @app.post("/v1/auth/refresh")
@@ -828,7 +828,7 @@ def auth_refresh(p: AuthRefreshPayload, request: Request):
     access_token = _jwt_make_access(user_id, email)
     ip = request.client.host if request.client else None
     _audit("/v1/auth/refresh", 200, user_id=user_id, ip=ip)
-    return {"access_token": access_token, "refresh_token": new_refresh, "token_type": "bearer"}
+    return {"access_token": access_token, "refresh_token": new_refresh, "token_type": "bearer", "profile_uuid": user_id}
 
 
 @app.post("/v1/auth/logout")
