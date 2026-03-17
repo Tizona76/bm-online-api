@@ -930,9 +930,9 @@ def lb_season_submit(p: LBSubmitPayload):
 
     q = text("""
         INSERT INTO leaderboard_season
-        (season_id, profile_uuid, pseudo, club, club_level, titles_total, winrate, score_final, meta_json, client_sig, updated_at)
+        (season_id, profile_uuid, pseudo, club, club_level, titles_total, winrate, score_final, wins, losses, games, meta_json, client_sig, updated_at)
         VALUES
-        (:season_id, :profile_uuid, :pseudo, :club, :club_level, :titles_total, :winrate, :score_final, CAST(:meta_json AS jsonb), :client_sig, NOW())
+        (:season_id, :profile_uuid, :pseudo, :club, :club_level, :titles_total, :winrate, :score_final, :wins, :losses, :games, CAST(:meta_json AS jsonb), :client_sig, NOW())
         ON CONFLICT (season_id, profile_uuid)
         DO UPDATE SET
             pseudo = EXCLUDED.pseudo,
@@ -941,6 +941,9 @@ def lb_season_submit(p: LBSubmitPayload):
             titles_total = EXCLUDED.titles_total,
             winrate = EXCLUDED.winrate,
             score_final = EXCLUDED.score_final,
+            wins = EXCLUDED.wins,
+            losses = EXCLUDED.losses,
+            games = EXCLUDED.games,
             meta_json = EXCLUDED.meta_json,
             client_sig = EXCLUDED.client_sig,
             updated_at = NOW()
@@ -949,6 +952,11 @@ def lb_season_submit(p: LBSubmitPayload):
     
     try:
         with eng.begin() as conn:
+            meta_obj = p.meta.model_dump() if hasattr(p.meta, "model_dump") else (p.meta or {})
+            wins = int((meta_obj or {}).get("wins", 0))
+            losses = int((meta_obj or {}).get("losses", 0))
+            games = int((meta_obj or {}).get("games", 0))
+
             params = {
                 "season_id": p.season_id,
                 "profile_uuid": p.profile_uuid,
@@ -958,6 +966,9 @@ def lb_season_submit(p: LBSubmitPayload):
                 "titles_total": int(p.titles_total),
                 "winrate": float(p.winrate),
                 "score_final": int(p.score_final),
+                "wins": wins,
+                "losses": losses,
+                "games": games,
                 "meta_json": meta_json,
                 "client_sig": (p.client_sig or "")[:128],
             }
