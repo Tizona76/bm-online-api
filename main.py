@@ -776,6 +776,54 @@ def auth_verify(p: AuthVerifyPayload, request: Request):
     return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer", "profile_uuid": user_id}
 
 
+
+@app.post("/v1/auth/guest")
+def auth_guest(request: Request):
+    if not _auth_init_schema():
+        raise HTTPException(status_code=503, detail="AUTH_DB_NOT_READY")
+
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="AUTH_DB_NOT_READY")
+
+    user_id = uuid.uuid4().hex
+    email = f"guest_{user_id}@guest.local"
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent", "")
+
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO users (user_id, email, email_verified, status, is_tester, created_at, last_login_at)
+            VALUES (:user_id, :email, FALSE, 'active', FALSE, NOW(), NOW());
+        """), {"user_id": user_id, "email": email})
+
+    access_token = _jwt_make_access(user_id, email)
+    refresh_token = _new_refresh_token()
+
+    sess_id = uuid.uuid4().hex
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO sessions (session_id, user_id, refresh_hash, created_at, expires_at, user_agent, ip)
+            VALUES (:sid, :uid, :rh, NOW(), :exp, :ua, :ip);
+        """), {
+            "sid": sess_id,
+            "uid": user_id,
+            "rh": _sha256(refresh_token),
+            "exp": _refresh_expires_at(),
+            "ua": ua[:256],
+            "ip": ip,
+        })
+
+    _audit("/v1/auth/guest", 200, user_id=user_id, ip=ip)
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "profile_uuid": user_id,
+        "guest": True
+    }
+
+
 @app.post("/v1/auth/refresh")
 def auth_refresh(p: AuthRefreshPayload, request: Request):
     if not _auth_init_schema():
