@@ -52,6 +52,17 @@ from email.mime.text import MIMEText
 
 app = FastAPI(title="BM Online API", version="0.0.2-cloudtest")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 @app.get("/debug/resend_env")
 def debug_resend_env():
     k = os.getenv("RESEND_API_KEY", "") or ""
