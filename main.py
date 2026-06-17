@@ -1315,6 +1315,21 @@ def _cloud_v1_load(profile_uuid: str) -> Dict[str, Any]:
     return {"ok": True, "profile_uuid": profile_uuid, "found": True, "blob": r[0], "updated_at": str(r[1])}
 
 
+
+class FunnelTeamNamePayload(BaseModel):
+    profile_uuid: Optional[str] = ""
+    team_name: Optional[str] = ""
+
+
+@app.post("/v1/funnel/team-name-created")
+def funnel_team_name_created(p: FunnelTeamNamePayload, request: Request):
+    ip = request.client.host if request.client else None
+    user_id = (p.profile_uuid or "").strip() or None
+    _audit("/v1/funnel/team-name-created", 200, user_id=user_id, ip=ip)
+    return {"ok": True}
+
+
+
 # -------- Routes (public path = V2) --------
 @app.post("/v1/cloud/save")
 def cloud_save_v2(p: CloudSavePayloadV2, request: Request, authorization: str = Header(default="")):
