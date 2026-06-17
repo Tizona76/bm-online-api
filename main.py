@@ -1328,7 +1328,66 @@ def funnel_team_name_created(p: FunnelTeamNamePayload, request: Request):
     _audit("/v1/funnel/team-name-created", 200, user_id=user_id, ip=ip)
     return {"ok": True}
 
+class FunnelProfilePayload(BaseModel):
+    profile_uuid: Optional[str] = ""
 
+
+@app.post("/v1/funnel/selection-validated")
+def funnel_selection_validated(p: FunnelProfilePayload, request: Request):
+    ip = request.client.host if request.client else None
+    user_id = (p.profile_uuid or "").strip() or None
+    _audit("/v1/funnel/selection-validated", 200, user_id=user_id, ip=ip)
+    return {"ok": True}
+
+
+@app.post("/v1/funnel/first-match-started")
+def funnel_first_match_started(p: FunnelProfilePayload, request: Request):
+    ip = request.client.host if request.client else None
+    user_id = (p.profile_uuid or "").strip() or None
+    _audit("/v1/funnel/first-match-started", 200, user_id=user_id, ip=ip)
+    return {"ok": True}
+
+
+@app.post("/v1/funnel/first-match-finished")
+def funnel_first_match_finished(p: FunnelProfilePayload, request: Request):
+    ip = request.client.host if request.client else None
+    user_id = (p.profile_uuid or "").strip() or None
+    _audit("/v1/funnel/first-match-finished", 200, user_id=user_id, ip=ip)
+    return {"ok": True}
+
+@app.get("/v1/funnel")
+def funnel_stats():
+
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="DB_NOT_READY")
+
+    events = [
+        "/v1/funnel/team-name-created",
+        "/v1/funnel/selection-validated",
+        "/v1/funnel/first-match-started",
+        "/v1/funnel/first-match-finished",
+    ]
+
+    out = {}
+
+    with eng.begin() as conn:
+        for event_name in events:
+            row = conn.execute(
+                text("""
+                    SELECT COUNT(DISTINCT user_id)
+                    FROM api_audit
+                    WHERE endpoint = :endpoint
+                """),
+                {"endpoint": event_name}
+            ).fetchone()
+
+            out[event_name.split("/")[-1]] = int(row[0] or 0)
+
+    return {
+        "ok": True,
+        "funnel": out
+    }
 
 # -------- Routes (public path = V2) --------
 @app.post("/v1/cloud/save")
