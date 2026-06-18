@@ -1384,9 +1384,21 @@ def funnel_stats():
 
             out[event_name.split("/")[-1]] = int(row[0] or 0)
 
+    team = int(out.get("team-name-created", 0))
+    selection = int(out.get("selection-validated", 0))
+    started = int(out.get("first-match-started", 0))
+    finished = int(out.get("first-match-finished", 0))
+
+    conversion = {
+        "team_to_selection": round((selection / team) * 100.0, 1) if team > 0 else 0.0,
+        "selection_to_match": round((started / selection) * 100.0, 1) if selection > 0 else 0.0,
+        "match_to_finish": round((finished / started) * 100.0, 1) if started > 0 else 0.0,
+    }
+
     return {
         "ok": True,
-        "funnel": out
+        "funnel": out,
+        "conversion": conversion
     }
 
 # -------- Routes (public path = V2) --------
