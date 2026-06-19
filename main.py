@@ -1316,6 +1316,35 @@ def _cloud_v1_load(profile_uuid: str) -> Dict[str, Any]:
 
 
 
+def _funnel_log(event_name: str, profile_uuid: Optional[str] = "", team_name: Optional[str] = "", ip: Optional[str] = None) -> None:
+    try:
+        eng = _lb_get_engine()
+        if eng is None:
+            return
+        with eng.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS funnel_events (
+                  id BIGSERIAL PRIMARY KEY,
+                  profile_uuid TEXT NULL,
+                  event_name TEXT NOT NULL,
+                  team_name TEXT NULL,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  ip TEXT NULL
+                );
+            """))
+            conn.execute(text("""
+                INSERT INTO funnel_events (profile_uuid, event_name, team_name, ip)
+                VALUES (:profile_uuid, :event_name, :team_name, :ip);
+            """), {
+                "profile_uuid": (profile_uuid or "").strip() or None,
+                "event_name": event_name,
+                "team_name": (team_name or "").strip() or None,
+                "ip": ip
+            })
+    except Exception:
+        pass
+
+
 class FunnelTeamNamePayload(BaseModel):
     profile_uuid: Optional[str] = ""
     team_name: Optional[str] = ""
@@ -1326,6 +1355,7 @@ def funnel_team_name_created(p: FunnelTeamNamePayload, request: Request):
     ip = request.client.host if request.client else None
     user_id = (p.profile_uuid or "").strip() or None
     _audit("/v1/funnel/team-name-created", 200, user_id=user_id, ip=ip)
+    _funnel_log("team-name-created", user_id, p.team_name or "", ip)
     return {"ok": True}
 
 class FunnelProfilePayload(BaseModel):
@@ -1337,6 +1367,7 @@ def funnel_selection_validated(p: FunnelProfilePayload, request: Request):
     ip = request.client.host if request.client else None
     user_id = (p.profile_uuid or "").strip() or None
     _audit("/v1/funnel/selection-validated", 200, user_id=user_id, ip=ip)
+    _funnel_log("selection-validated", user_id, "", ip)
     return {"ok": True}
 
 
@@ -1345,6 +1376,7 @@ def funnel_first_match_started(p: FunnelProfilePayload, request: Request):
     ip = request.client.host if request.client else None
     user_id = (p.profile_uuid or "").strip() or None
     _audit("/v1/funnel/first-match-started", 200, user_id=user_id, ip=ip)
+    _funnel_log("first-match-started", user_id, "", ip)
     return {"ok": True}
 
 
@@ -1353,6 +1385,7 @@ def funnel_first_match_finished(p: FunnelProfilePayload, request: Request):
     ip = request.client.host if request.client else None
     user_id = (p.profile_uuid or "").strip() or None
     _audit("/v1/funnel/first-match-finished", 200, user_id=user_id, ip=ip)
+    _funnel_log("first-match-finished", user_id, "", ip)
     return {"ok": True}
 
 @app.get("/v1/funnel")
@@ -1400,6 +1433,56 @@ def funnel_stats():
         "funnel": out,
         "conversion": conversion
     }
+
+@app.get("/v1/funnel/table")
+def funnel_table(limit: int = 100):
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="DB_NOT_READY")
+
+    with eng.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS funnel_events (
+              id BIGSERIAL PRIMARY KEY,
+              profile_uuid TEXT NULL,
+              event_name TEXT NOT NULL,
+              team_name TEXT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              ip TEXT NULL
+            );
+        """))
+
+        rows = conn.execute(text("""
+            SELECT
+              profile_uuid,
+              MAX(team_name) FILTER (WHERE team_name IS NOT NULL) AS team_name,
+              MIN(created_at) FILTER (WHERE event_name = 'team-name-created') AS team_name_created_at,
+              MIN(created_at) FILTER (WHERE event_name = 'selection-validated') AS selection_validated_at,
+              MIN(created_at) FILTER (WHERE event_name = 'first-match-started') AS first_match_started_at,
+              MIN(created_at) FILTER (WHERE event_name = 'first-match-finished') AS first_match_finished_at
+            FROM funnel_events
+            WHERE profile_uuid IS NOT NULL
+            GROUP BY profile_uuid
+            ORDER BY COALESCE(
+              MIN(created_at) FILTER (WHERE event_name = 'team-name-created'),
+              MIN(created_at)
+            ) DESC
+            LIMIT :limit;
+        """), {"limit": max(1, min(int(limit), 500))}).fetchall()
+
+    items = []
+    for r in rows:
+        items.append({
+            "profile_uuid": r[0],
+            "team_name": r[1],
+            "team_name_created_at": str(r[2]) if r[2] else None,
+            "selection_validated_at": str(r[3]) if r[3] else None,
+            "first_match_started_at": str(r[4]) if r[4] else None,
+            "first_match_finished_at": str(r[5]) if r[5] else None,
+        })
+
+    return {"ok": True, "items": items}
+
 
 # -------- Routes (public path = V2) --------
 @app.post("/v1/cloud/save")
