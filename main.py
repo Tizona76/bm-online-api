@@ -1388,6 +1388,89 @@ def funnel_first_match_finished(p: FunnelProfilePayload, request: Request):
     _funnel_log("first-match-finished", user_id, "", ip)
     return {"ok": True}
 
+
+FUNNEL_GENERIC_EVENTS = (
+    "second-match-started",
+    "eleventh-match-started",
+    "season-finished",
+    "season2-started",
+    "season2-match10",
+)
+
+
+class FunnelEventPayload(BaseModel):
+    profile_uuid: Optional[str] = ""
+    event_name: str
+    team_name: Optional[str] = ""
+    meta: Optional[Dict[str, Any]] = None
+
+
+def _funnel_log_generic(p: FunnelEventPayload, ip: Optional[str]) -> bool:
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="DB_NOT_READY")
+
+    meta_json = json.dumps(p.meta or {}, separators=(",", ":"))
+    with eng.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS funnel_events (
+              id BIGSERIAL PRIMARY KEY,
+              profile_uuid TEXT NULL,
+              event_name TEXT NOT NULL,
+              team_name TEXT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              ip TEXT NULL
+            );
+        """))
+        conn.execute(text("""
+            ALTER TABLE funnel_events
+            ADD COLUMN IF NOT EXISTS meta_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS funnel_events_unique_generic_milestone
+            ON funnel_events (profile_uuid, event_name)
+            WHERE profile_uuid IS NOT NULL
+              AND event_name IN (
+                'second-match-started',
+                'eleventh-match-started',
+                'season-finished',
+                'season2-started',
+                'season2-match10'
+              );
+        """))
+        result = conn.execute(text("""
+            INSERT INTO funnel_events (profile_uuid, event_name, team_name, ip, meta_json)
+            VALUES (:profile_uuid, :event_name, :team_name, :ip, CAST(:meta_json AS JSONB))
+            ON CONFLICT DO NOTHING;
+        """), {
+            "profile_uuid": p.profile_uuid.strip(),
+            "event_name": p.event_name,
+            "team_name": (p.team_name or "").strip() or None,
+            "ip": ip,
+            "meta_json": meta_json,
+        })
+    return bool(result.rowcount)
+
+
+@app.post("/v1/funnel/event")
+def funnel_event(p: FunnelEventPayload, request: Request):
+    profile_uuid = (p.profile_uuid or "").strip()
+    event_name = (p.event_name or "").strip()
+    if not profile_uuid:
+        raise HTTPException(status_code=400, detail="MISSING_PROFILE_UUID")
+    if event_name not in FUNNEL_GENERIC_EVENTS:
+        raise HTTPException(status_code=400, detail="INVALID_EVENT_NAME")
+    if len(json.dumps(p.meta or {})) > 4096:
+        raise HTTPException(status_code=400, detail="META_TOO_LARGE")
+
+    p.profile_uuid = profile_uuid
+    p.event_name = event_name
+    ip = request.client.host if request.client else None
+    _audit("/v1/funnel/event", 200, user_id=profile_uuid, ip=ip)
+    inserted = _funnel_log_generic(p, ip)
+    return {"ok": True, "inserted": inserted}
+
+
 @app.get("/v1/funnel")
 def funnel_stats():
 
@@ -1416,6 +1499,18 @@ def funnel_stats():
             ).fetchone()
 
             out[event_name.split("/")[-1]] = int(row[0] or 0)
+
+        for event_name in FUNNEL_GENERIC_EVENTS:
+            row = conn.execute(
+                text("""
+                    SELECT COUNT(DISTINCT profile_uuid)
+                    FROM funnel_events
+                    WHERE event_name = :event_name
+                      AND profile_uuid IS NOT NULL
+                """),
+                {"event_name": event_name}
+            ).fetchone()
+            out[event_name] = int(row[0] or 0)
 
     team = int(out.get("team-name-created", 0))
     selection = int(out.get("selection-validated", 0))
@@ -1459,7 +1554,12 @@ def funnel_table(limit: int = 100):
               MIN(created_at) FILTER (WHERE event_name = 'team-name-created') AS team_name_created_at,
               MIN(created_at) FILTER (WHERE event_name = 'selection-validated') AS selection_validated_at,
               MIN(created_at) FILTER (WHERE event_name = 'first-match-started') AS first_match_started_at,
-              MIN(created_at) FILTER (WHERE event_name = 'first-match-finished') AS first_match_finished_at
+              MIN(created_at) FILTER (WHERE event_name = 'first-match-finished') AS first_match_finished_at,
+              MIN(created_at) FILTER (WHERE event_name = 'second-match-started') AS second_match_started_at,
+              MIN(created_at) FILTER (WHERE event_name = 'eleventh-match-started') AS eleventh_match_started_at,
+              MIN(created_at) FILTER (WHERE event_name = 'season-finished') AS season_finished_at,
+              MIN(created_at) FILTER (WHERE event_name = 'season2-started') AS season2_started_at,
+              MIN(created_at) FILTER (WHERE event_name = 'season2-match10') AS season2_match10_at
             FROM funnel_events
             WHERE profile_uuid IS NOT NULL
             GROUP BY profile_uuid
@@ -1479,6 +1579,11 @@ def funnel_table(limit: int = 100):
             "selection_validated_at": str(r[3]) if r[3] else None,
             "first_match_started_at": str(r[4]) if r[4] else None,
             "first_match_finished_at": str(r[5]) if r[5] else None,
+            "second_match_started_at": str(r[6]) if r[6] else None,
+            "eleventh_match_started_at": str(r[7]) if r[7] else None,
+            "season_finished_at": str(r[8]) if r[8] else None,
+            "season2_started_at": str(r[9]) if r[9] else None,
+            "season2_match10_at": str(r[10]) if r[10] else None,
         })
 
     return {"ok": True, "items": items}
