@@ -7,3 +7,5 @@ python-jose[cryptography]==3.3.0
 
 email-validator==2.2.0
 
+
+stripe==10.12.0

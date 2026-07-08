@@ -10,6 +10,11 @@ import secrets
 import urllib.request
 import urllib.error
 
+try:
+    import stripe as stripe_sdk
+except Exception:
+    stripe_sdk = None
+
 
 from datetime import datetime, timedelta, timezone
 
@@ -362,6 +367,37 @@ _TESTERS_WHITELIST = set([e.strip().lower() for e in (os.environ.get("TESTERS_EM
 # Migration : autoriser l'ancien HMAC (API_SALT_V1) en dev seulement
 ALLOW_HMAC_V1 = (os.environ.get("ALLOW_HMAC_V1", "0") or "0").strip() == "1"
 
+# Stripe Checkout (SAFE 1: infrastructure only, no Token credit)
+STRIPE_SECRET_KEY = (os.environ.get("STRIPE_SECRET_KEY", "") or "").strip()
+STRIPE_PUBLISHABLE_KEY = (os.environ.get("STRIPE_PUBLISHABLE_KEY", "") or "").strip()
+STRIPE_WEBHOOK_SECRET = (os.environ.get("STRIPE_WEBHOOK_SECRET", "") or "").strip()
+STRIPE_SUCCESS_URL = (os.environ.get("STRIPE_SUCCESS_URL", "https://basketmanager-game.com/stripe/success?session_id={CHECKOUT_SESSION_ID}") or "").strip()
+STRIPE_CANCEL_URL = (os.environ.get("STRIPE_CANCEL_URL", "https://basketmanager-game.com/stripe/cancel") or "").strip()
+
+STRIPE_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
+    "starter": {
+        "pack_id": "starter",
+        "stripe_price_id": (os.environ.get("STRIPE_PRICE_STARTER", "") or "").strip(),
+        "tokens": 25,
+        "amount": 99,
+        "currency": "eur",
+    },
+    "club": {
+        "pack_id": "club",
+        "stripe_price_id": (os.environ.get("STRIPE_PRICE_CLUB", "") or "").strip(),
+        "tokens": 75,
+        "amount": 299,
+        "currency": "eur",
+    },
+    "manager": {
+        "pack_id": "manager",
+        "stripe_price_id": (os.environ.get("STRIPE_PRICE_MANAGER", "") or "").strip(),
+        "tokens": 150,
+        "amount": 499,
+        "currency": "eur",
+    },
+}
+
 
 # -------- Helpers (time / hash / jwt) --------
 def _utcnow() -> datetime:
@@ -586,6 +622,26 @@ def _auth_init_schema() -> bool:
               ON cloud_saves_v2 (user_id, profile_uuid);
             """,
             """
+            CREATE TABLE IF NOT EXISTS payments (
+              payment_id               TEXT PRIMARY KEY,
+              user_id                  TEXT NOT NULL REFERENCES users(user_id),
+              profile_uuid             TEXT NOT NULL,
+              provider                 TEXT NOT NULL DEFAULT 'stripe',
+              stripe_session_id        TEXT UNIQUE,
+              stripe_payment_intent_id TEXT UNIQUE,
+              pack_id                  TEXT NOT NULL,
+              amount                   INT NOT NULL,
+              currency                 TEXT NOT NULL,
+              status                   TEXT NOT NULL,
+              created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS payments_user_profile_idx
+              ON payments (user_id, profile_uuid, created_at DESC);
+            """,
+            """
             CREATE TABLE IF NOT EXISTS api_audit (
               id           BIGSERIAL PRIMARY KEY,
               user_id      TEXT NULL,
@@ -638,6 +694,10 @@ class CloudSavePayloadV2(BaseModel):
     blob: Dict[str, Any]
     client_rev: Optional[int] = None
     checksum: Optional[str] = ""
+
+
+class CreateCheckoutSessionPayload(BaseModel):
+    pack_id: str
 
 
 # -------- Auth endpoints (OTP) --------
@@ -1587,6 +1647,190 @@ def funnel_table(limit: int = 100):
         })
 
     return {"ok": True, "items": items}
+
+
+
+# ============================================================
+# PAYMENTS - Stripe Checkout (SAFE 1: no Token credit)
+# ============================================================
+
+def _stripe_require_config() -> None:
+    if stripe_sdk is None:
+        raise HTTPException(status_code=503, detail="STRIPE_SDK_NOT_AVAILABLE")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="STRIPE_SECRET_KEY_NOT_CONFIGURED")
+    stripe_sdk.api_key = STRIPE_SECRET_KEY
+
+
+def _stripe_get_pack(pack_id: str) -> Dict[str, Any]:
+    pid = (pack_id or "").strip().lower()
+    pack = STRIPE_TOKEN_PACKS.get(pid)
+    if not pack:
+        raise HTTPException(status_code=400, detail="UNKNOWN_PACK")
+    if not str(pack.get("stripe_price_id", "")).strip():
+        raise HTTPException(status_code=503, detail="STRIPE_PRICE_NOT_CONFIGURED")
+    return pack
+
+
+def _payment_profile_uuid_from_claims(claims: Dict[str, Any]) -> str:
+    # SAFE 1: the client sends only pack_id. Guest auth already uses user_id as profile_uuid.
+    return str(claims.get("sub") or "")
+
+
+def _payment_upsert_checkout_session(conn, *, payment_id: str, user_id: str, profile_uuid: str,
+                                     session_id: str, payment_intent_id: str, pack: Dict[str, Any],
+                                     status: str) -> None:
+    conn.execute(text("""
+        INSERT INTO payments (
+          payment_id, user_id, profile_uuid, provider, stripe_session_id, stripe_payment_intent_id,
+          pack_id, amount, currency, status, created_at, updated_at
+        ) VALUES (
+          :payment_id, :user_id, :profile_uuid, 'stripe', :stripe_session_id, :stripe_payment_intent_id,
+          :pack_id, :amount, :currency, :status, NOW(), NOW()
+        )
+        ON CONFLICT (stripe_session_id)
+        DO UPDATE SET
+          stripe_payment_intent_id = COALESCE(EXCLUDED.stripe_payment_intent_id, payments.stripe_payment_intent_id),
+          status = EXCLUDED.status,
+          updated_at = NOW();
+    """), {
+        "payment_id": payment_id,
+        "user_id": user_id,
+        "profile_uuid": profile_uuid,
+        "stripe_session_id": session_id,
+        "stripe_payment_intent_id": payment_intent_id or None,
+        "pack_id": str(pack.get("pack_id", "")),
+        "amount": int(pack.get("amount", 0)),
+        "currency": str(pack.get("currency", "eur")),
+        "status": status,
+    })
+
+
+@app.post("/v1/payments/create_checkout_session")
+def create_checkout_session(p: CreateCheckoutSessionPayload, request: Request, authorization: str = Header(default="")):
+    claims = _require_bearer_claims(authorization)
+    user_id = str(claims.get("sub") or "")
+    profile_uuid = _payment_profile_uuid_from_claims(claims)
+
+    _rl_global(user_id)
+    _stripe_require_config()
+    pack = _stripe_get_pack(p.pack_id)
+
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
+    if not _auth_init_schema():
+        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
+
+    try:
+        session = stripe_sdk.checkout.Session.create(
+            mode="payment",
+            line_items=[{"price": str(pack["stripe_price_id"]), "quantity": 1}],
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
+            client_reference_id=user_id,
+            metadata={
+                "user_id": user_id,
+                "profile_uuid": profile_uuid,
+                "pack_id": str(pack["pack_id"]),
+                "tokens": str(int(pack["tokens"])),
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"STRIPE_CHECKOUT_CREATE_FAILED:{type(e).__name__}")
+
+    session_id = str(getattr(session, "id", "") or session.get("id", ""))
+    checkout_url = str(getattr(session, "url", "") or session.get("url", ""))
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="STRIPE_CHECKOUT_BAD_RESPONSE")
+
+    with eng.begin() as conn:
+        _payment_upsert_checkout_session(
+            conn,
+            payment_id=uuid.uuid4().hex,
+            user_id=user_id,
+            profile_uuid=profile_uuid,
+            session_id=session_id,
+            payment_intent_id="",
+            pack=pack,
+            status="checkout_created",
+        )
+
+    ip = request.client.host if request.client else None
+    _audit("/v1/payments/create_checkout_session", 200, user_id=user_id, ip=ip)
+    return {"ok": True, "url": checkout_url}
+
+
+@app.post("/v1/payments/stripe/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str = Header(default="", alias="Stripe-Signature")):
+    if stripe_sdk is None:
+        raise HTTPException(status_code=503, detail="STRIPE_SDK_NOT_AVAILABLE")
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="STRIPE_WEBHOOK_SECRET_NOT_CONFIGURED")
+
+    payload = await request.body()
+    try:
+        event = stripe_sdk.Webhook.construct_event(payload, stripe_signature, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="INVALID_WEBHOOK_PAYLOAD")
+    except Exception:
+        raise HTTPException(status_code=400, detail="INVALID_WEBHOOK_SIGNATURE")
+
+    event_type = str(event.get("type", ""))
+    if event_type not in {
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+        "checkout.session.async_payment_failed",
+        "checkout.session.expired",
+    }:
+        return {"ok": True, "ignored": event_type}
+
+    session = event.get("data", {}).get("object", {})
+    session_id = str(session.get("id", "") or "")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="MISSING_STRIPE_SESSION_ID")
+
+    metadata = session.get("metadata") or {}
+    pack_id = str(metadata.get("pack_id", "")).strip().lower()
+    pack = STRIPE_TOKEN_PACKS.get(pack_id)
+    if not pack:
+        raise HTTPException(status_code=400, detail="UNKNOWN_PACK")
+
+    user_id = str(metadata.get("user_id", "") or session.get("client_reference_id", "")).strip()
+    profile_uuid = str(metadata.get("profile_uuid", "") or user_id).strip()
+    if not user_id or not profile_uuid:
+        raise HTTPException(status_code=400, detail="MISSING_PAYMENT_OWNER")
+
+    payment_status = str(session.get("payment_status", "") or "")
+    status = "webhook_received"
+    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+        status = "paid" if payment_status in {"", "paid"} else payment_status
+    elif event_type == "checkout.session.async_payment_failed":
+        status = "failed"
+    elif event_type == "checkout.session.expired":
+        status = "expired"
+
+    payment_intent_id = str(session.get("payment_intent", "") or "")
+
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
+    if not _auth_init_schema():
+        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
+
+    with eng.begin() as conn:
+        _payment_upsert_checkout_session(
+            conn,
+            payment_id=uuid.uuid4().hex,
+            user_id=user_id,
+            profile_uuid=profile_uuid,
+            session_id=session_id,
+            payment_intent_id=payment_intent_id,
+            pack=pack,
+            status=status,
+        )
+
+    return {"ok": True, "event": event_type, "status": status}
 
 
 # -------- Routes (public path = V2) --------
