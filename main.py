@@ -3,6 +3,7 @@ from pydantic import BaseModel, EmailStr
 from typing import Any, Dict, Optional
 import json
 import hashlib
+import copy
 import os
 import time
 import uuid
@@ -1228,6 +1229,33 @@ def lb_season_me(season_id: str, profile_uuid: str, metric: str = "score_final")
 # CLOUD SAVE — V2 (Bearer) + Legacy V1 (HMAC) migration
 # ============================================================
 
+def _club_token_wallet_get_or_create(conn, user_id: str, profile_uuid: str) -> int:
+    conn.execute(text("""
+        INSERT INTO club_token_wallets (user_id, profile_uuid, tokens, updated_at)
+        VALUES (:uid, :p, 0, NOW())
+        ON CONFLICT (user_id, profile_uuid) DO NOTHING;
+    """), {"uid": user_id, "p": profile_uuid})
+
+    row = conn.execute(text("""
+        SELECT tokens
+        FROM club_token_wallets
+        WHERE user_id = :uid AND profile_uuid = :p
+        LIMIT 1;
+    """), {"uid": user_id, "p": profile_uuid}).fetchone()
+
+    return max(0, int(row[0])) if row else 0
+
+
+def _cloud_blob_with_server_tokens(blob: Dict[str, Any], server_tokens: int) -> Dict[str, Any]:
+    clean_blob = copy.deepcopy(blob or {})
+    if not isinstance(clean_blob, dict):
+        clean_blob = {}
+    if not isinstance(clean_blob.get("wallet"), dict):
+        clean_blob["wallet"] = {}
+    clean_blob["wallet"]["tokens"] = max(0, int(server_tokens))
+    return clean_blob
+
+
 def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client_rev: Optional[int], checksum: str) -> Dict[str, Any]:
     if not _auth_init_schema():
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
@@ -1236,11 +1264,6 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
         raise HTTPException(status_code=400, detail="BAD_PROFILE_UUID")
     if not isinstance(blob, dict):
         raise HTTPException(status_code=400, detail="BAD_BLOB")
-
-    blob_json = json.dumps(blob or {}, separators=(",", ":"), ensure_ascii=False)
-    blob_bytes = blob_json.encode("utf-8")
-    if len(blob_bytes) > MAX_BLOB_BYTES:
-        raise HTTPException(status_code=413, detail="BLOB_TOO_LARGE")
 
     eng = _lb_get_engine()
     if eng is None:
@@ -1254,12 +1277,18 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
             LIMIT 1;
         """), {"uid": user_id, "p": profile_uuid}).fetchone()
         server_rev = int(r[0]) if r else 0
+        server_tokens = _club_token_wallet_get_or_create(conn, user_id, profile_uuid)
 
         if client_rev is not None and server_rev and int(client_rev) < server_rev:
             raise HTTPException(status_code=409, detail="REV_CONFLICT")
 
         new_rev = server_rev + 1 if server_rev else 1
         save_id = uuid.uuid4().hex
+        safe_blob = _cloud_blob_with_server_tokens(blob, server_tokens)
+        blob_json = json.dumps(safe_blob, separators=(",", ":"), ensure_ascii=False)
+        blob_bytes = blob_json.encode("utf-8")
+        if len(blob_bytes) > MAX_BLOB_BYTES:
+            raise HTTPException(status_code=413, detail="BLOB_TOO_LARGE")
 
         q = text("""
             INSERT INTO cloud_saves_v2 (save_id, user_id, profile_uuid, rev, checksum, blob_json, blob_size, updated_at)
@@ -1298,6 +1327,7 @@ def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
     with eng.begin() as conn:
+        server_tokens = _club_token_wallet_get_or_create(conn, user_id, profile_uuid)
         r = conn.execute(text("""
             SELECT blob_json, rev, checksum, updated_at
             FROM cloud_saves_v2
@@ -1308,11 +1338,13 @@ def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
     if not r:
         return {"ok": True, "profile_uuid": profile_uuid, "found": False, "blob": None}
 
+    safe_blob = _cloud_blob_with_server_tokens(r[0] if isinstance(r[0], dict) else {}, server_tokens)
+
     return {
         "ok": True,
         "profile_uuid": profile_uuid,
         "found": True,
-        "blob": r[0],
+        "blob": safe_blob,
         "rev": int(r[1]),
         "checksum": r[2] or "",
         "updated_at": str(r[3]),
