@@ -622,6 +622,15 @@ def _auth_init_schema() -> bool:
               ON cloud_saves_v2 (user_id, profile_uuid);
             """,
             """
+            CREATE TABLE IF NOT EXISTS club_token_wallets (
+              user_id       TEXT NOT NULL REFERENCES users(user_id),
+              profile_uuid  TEXT NOT NULL,
+              tokens        INT NOT NULL DEFAULT 0 CHECK (tokens >= 0),
+              updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              CONSTRAINT club_token_wallets_uq UNIQUE (user_id, profile_uuid)
+            );
+            """,
+            """
             CREATE TABLE IF NOT EXISTS payments (
               payment_id               TEXT PRIMARY KEY,
               user_id                  TEXT NOT NULL REFERENCES users(user_id),
@@ -633,9 +642,14 @@ def _auth_init_schema() -> bool:
               amount                   INT NOT NULL,
               currency                 TEXT NOT NULL,
               status                   TEXT NOT NULL,
+              credited_at              TIMESTAMPTZ NULL,
               created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """,
+            """
+            ALTER TABLE payments
+              ADD COLUMN IF NOT EXISTS credited_at TIMESTAMPTZ NULL;
             """,
             """
             CREATE INDEX IF NOT EXISTS payments_user_profile_idx
@@ -1691,7 +1705,10 @@ def _payment_upsert_checkout_session(conn, *, payment_id: str, user_id: str, pro
         ON CONFLICT (stripe_session_id)
         DO UPDATE SET
           stripe_payment_intent_id = COALESCE(EXCLUDED.stripe_payment_intent_id, payments.stripe_payment_intent_id),
-          status = EXCLUDED.status,
+          status = CASE
+            WHEN payments.credited_at IS NOT NULL THEN payments.status
+            ELSE EXCLUDED.status
+          END,
           updated_at = NOW();
     """), {
         "payment_id": payment_id,
@@ -1704,6 +1721,47 @@ def _payment_upsert_checkout_session(conn, *, payment_id: str, user_id: str, pro
         "currency": str(pack.get("currency", "eur")),
         "status": status,
     })
+
+
+def _payment_credit_tokens_once(conn, *, stripe_session_id: str, user_id: str, profile_uuid: str, tokens: int) -> bool:
+    if not stripe_session_id or not user_id or not profile_uuid or int(tokens) <= 0:
+        return False
+
+    row = conn.execute(text("""
+        SELECT status, credited_at
+        FROM payments
+        WHERE stripe_session_id = :stripe_session_id
+        LIMIT 1
+        FOR UPDATE;
+    """), {"stripe_session_id": stripe_session_id}).fetchone()
+
+    if not row:
+        return False
+    if row[1] is not None or str(row[0] or "") == "credited":
+        return False
+
+    conn.execute(text("""
+        INSERT INTO club_token_wallets (user_id, profile_uuid, tokens, updated_at)
+        VALUES (:user_id, :profile_uuid, 0, NOW())
+        ON CONFLICT (user_id, profile_uuid) DO NOTHING;
+    """), {"user_id": user_id, "profile_uuid": profile_uuid})
+
+    conn.execute(text("""
+        UPDATE club_token_wallets
+        SET tokens = tokens + :tokens,
+            updated_at = NOW()
+        WHERE user_id = :user_id AND profile_uuid = :profile_uuid;
+    """), {"user_id": user_id, "profile_uuid": profile_uuid, "tokens": int(tokens)})
+
+    conn.execute(text("""
+        UPDATE payments
+        SET status = 'credited',
+            credited_at = NOW(),
+            updated_at = NOW()
+        WHERE stripe_session_id = :stripe_session_id;
+    """), {"stripe_session_id": stripe_session_id})
+
+    return True
 
 
 @app.post("/v1/payments/create_checkout_session")
@@ -1818,6 +1876,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(defaul
     if not _auth_init_schema():
         raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
 
+    credited = False
     with eng.begin() as conn:
         _payment_upsert_checkout_session(
             conn,
@@ -1830,7 +1889,18 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(defaul
             status=status,
         )
 
-    return {"ok": True, "event": event_type, "status": status}
+        if event_type == "checkout.session.completed" and payment_status == "paid":
+            credited = _payment_credit_tokens_once(
+                conn,
+                stripe_session_id=session_id,
+                user_id=user_id,
+                profile_uuid=profile_uuid,
+                tokens=int(pack.get("tokens", 0)),
+            )
+            if credited:
+                status = "credited"
+
+    return {"ok": True, "event": event_type, "status": status, "credited": credited}
 
 
 # -------- Routes (public path = V2) --------
