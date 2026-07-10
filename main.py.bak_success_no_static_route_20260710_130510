@@ -8,7 +8,6 @@ import os
 import time
 import uuid
 import secrets
-import base64
 import urllib.request
 import urllib.error
 
@@ -60,6 +59,7 @@ from email.mime.text import MIMEText
 app = FastAPI(title="BM Online API", version="0.0.2-cloudtest")
 
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,16 +69,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+PAYMENT_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "payment_assets")
+if os.path.isdir(PAYMENT_ASSETS_DIR):
+    app.mount("/payment-assets", StaticFiles(directory=PAYMENT_ASSETS_DIR), name="payment_assets")
 
-
-def _payment_background_data_uri() -> str:
-    path = os.path.join(os.path.dirname(__file__), "payment_assets", "fond_match.png")
-    try:
-        with open(path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
-    except Exception:
-        return ""
 
 def _payment_static_page(title: str, body: str) -> Response:
     html = f"""<!doctype html>
@@ -108,18 +102,16 @@ def _payment_static_page(title: str, body: str) -> Response:
 
 @app.get("/payment/success")
 def payment_success():
-    bg_url = _payment_background_data_uri()
-    background_image = f"url('{bg_url}') center / cover no-repeat," if bg_url else ""
-    html = f"""<!doctype html>
+    html = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Payment successful!</title>
   <style>
-    :root {{ color-scheme: dark; }}
-    * {{ box-sizing: border-box; }}
-    body {{
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
       margin: 0;
       min-height: 100vh;
       display: grid;
@@ -129,14 +121,14 @@ def payment_success():
       text-align: center;
       background:
         linear-gradient(rgba(3, 8, 20, 0.58), rgba(3, 8, 20, 0.72)),
-        {background_image}
+        url('/payment-assets/fond_match.png') center / cover no-repeat,
         #06152f;
-    }}
-    main {{ width: min(680px, calc(100vw - 40px)); padding: 56px 20px; }}
-    .ball {{ font-size: 54px; line-height: 1; margin-bottom: 26px; }}
-    h1 {{ margin: 0 0 18px; font-size: clamp(34px, 6vw, 56px); font-weight: 800; letter-spacing: 0; }}
-    p {{ margin: 10px auto 0; max-width: 560px; font-size: clamp(18px, 2.4vw, 22px); line-height: 1.5; color: rgba(238, 246, 255, 0.94); }}
-    button {{
+    }
+    main { width: min(680px, calc(100vw - 40px)); padding: 56px 20px; }
+    .ball { font-size: 54px; line-height: 1; margin-bottom: 26px; }
+    h1 { margin: 0 0 18px; font-size: clamp(34px, 6vw, 56px); font-weight: 800; letter-spacing: 0; }
+    p { margin: 10px auto 0; max-width: 560px; font-size: clamp(18px, 2.4vw, 22px); line-height: 1.5; color: rgba(238, 246, 255, 0.94); }
+    button {
       margin-top: 38px;
       border: 0;
       border-radius: 10px;
@@ -148,9 +140,9 @@ def payment_success():
       font-weight: 800;
       cursor: pointer;
       box-shadow: 0 12px 26px rgba(0, 0, 0, 0.30);
-    }}
-    button:active {{ transform: translateY(1px); }}
-    #closeHint {{ display: none; margin-top: 18px; font-size: 17px; color: rgba(238, 246, 255, 0.86); }}
+    }
+    button:active { transform: translateY(1px); }
+    #closeHint { display: none; margin-top: 18px; font-size: 17px; color: rgba(238, 246, 255, 0.86); }
   </style>
 </head>
 <body>
@@ -159,7 +151,7 @@ def payment_success():
     <h1>Payment successful!</h1>
     <p>Your purchase has been confirmed.</p>
     <p>Your Club Tokens are being synchronized.</p>
-    <button type="button" onclick="window.close(); setTimeout(function(){{ document.getElementById('closeHint').style.display='block'; }}, 250);">Return to Basket Manager</button>
+    <button type="button" onclick="window.close(); setTimeout(function(){ document.getElementById('closeHint').style.display='block'; }, 250);">Return to Basket Manager</button>
     <div id="closeHint">Return to your Basket Manager tab.</div>
   </main>
 </body>

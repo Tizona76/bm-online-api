@@ -8,7 +8,6 @@ import os
 import time
 import uuid
 import secrets
-import base64
 import urllib.request
 import urllib.error
 
@@ -70,16 +69,6 @@ app.add_middleware(
 )
 
 
-
-def _payment_background_data_uri() -> str:
-    path = os.path.join(os.path.dirname(__file__), "payment_assets", "fond_match.png")
-    try:
-        with open(path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
-    except Exception:
-        return ""
-
 def _payment_static_page(title: str, body: str) -> Response:
     html = f"""<!doctype html>
 <html lang="en">
@@ -108,63 +97,10 @@ def _payment_static_page(title: str, body: str) -> Response:
 
 @app.get("/payment/success")
 def payment_success():
-    bg_url = _payment_background_data_uri()
-    background_image = f"url('{bg_url}') center / cover no-repeat," if bg_url else ""
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Payment successful!</title>
-  <style>
-    :root {{ color-scheme: dark; }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      font-family: Arial, Helvetica, sans-serif;
-      color: #fff;
-      text-align: center;
-      background:
-        linear-gradient(rgba(3, 8, 20, 0.58), rgba(3, 8, 20, 0.72)),
-        {background_image}
-        #06152f;
-    }}
-    main {{ width: min(680px, calc(100vw - 40px)); padding: 56px 20px; }}
-    .ball {{ font-size: 54px; line-height: 1; margin-bottom: 26px; }}
-    h1 {{ margin: 0 0 18px; font-size: clamp(34px, 6vw, 56px); font-weight: 800; letter-spacing: 0; }}
-    p {{ margin: 10px auto 0; max-width: 560px; font-size: clamp(18px, 2.4vw, 22px); line-height: 1.5; color: rgba(238, 246, 255, 0.94); }}
-    button {{
-      margin-top: 38px;
-      border: 0;
-      border-radius: 10px;
-      padding: 17px 30px;
-      min-width: min(360px, 100%);
-      background: #19b85a;
-      color: #fff;
-      font-size: 20px;
-      font-weight: 800;
-      cursor: pointer;
-      box-shadow: 0 12px 26px rgba(0, 0, 0, 0.30);
-    }}
-    button:active {{ transform: translateY(1px); }}
-    #closeHint {{ display: none; margin-top: 18px; font-size: 17px; color: rgba(238, 246, 255, 0.86); }}
-  </style>
-</head>
-<body>
-  <main>
-    <div class="ball" aria-hidden="true">🏀</div>
-    <h1>Payment successful!</h1>
-    <p>Your purchase has been confirmed.</p>
-    <p>Your Club Tokens are being synchronized.</p>
-    <button type="button" onclick="window.close(); setTimeout(function(){{ document.getElementById('closeHint').style.display='block'; }}, 250);">Return to Basket Manager</button>
-    <div id="closeHint">Return to your Basket Manager tab.</div>
-  </main>
-</body>
-</html>"""
-    return Response(content=html, media_type="text/html; charset=utf-8")
+    return _payment_static_page(
+        "Payment successful",
+        "Your Club Tokens are being added to your Basket Manager account.<br>You can now close this tab and return to the game.",
+    )
 
 
 @app.get("/payment/cancel")

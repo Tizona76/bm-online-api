@@ -3,19 +3,12 @@ from pydantic import BaseModel, EmailStr
 from typing import Any, Dict, Optional
 import json
 import hashlib
-import copy
 import os
 import time
 import uuid
 import secrets
-import base64
 import urllib.request
 import urllib.error
-
-try:
-    import stripe as stripe_sdk
-except Exception:
-    stripe_sdk = None
 
 
 from datetime import datetime, timedelta, timezone
@@ -58,122 +51,6 @@ from email.mime.text import MIMEText
 
 
 app = FastAPI(title="BM Online API", version="0.0.2-cloudtest")
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-
-def _payment_background_data_uri() -> str:
-    path = os.path.join(os.path.dirname(__file__), "payment_assets", "fond_match.png")
-    try:
-        with open(path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
-    except Exception:
-        return ""
-
-def _payment_static_page(title: str, body: str) -> Response:
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <style>
-    body {{ margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: Arial, sans-serif; background: #06152f; color: #fff; text-align: center; }}
-    main {{ max-width: 560px; padding: 32px; }}
-    h1 {{ margin: 0 0 16px; font-size: 32px; }}
-    p {{ font-size: 18px; line-height: 1.45; color: #dbeafe; }}
-    button {{ margin-top: 18px; border: 0; border-radius: 8px; padding: 12px 18px; background: #20b455; color: #fff; font-size: 16px; cursor: pointer; }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>{title}</h1>
-    <p>{body}</p>
-    <button onclick="window.close()">Close this tab</button>
-  </main>
-</body>
-</html>"""
-    return Response(content=html, media_type="text/html; charset=utf-8")
-
-
-@app.get("/payment/success")
-def payment_success():
-    bg_url = _payment_background_data_uri()
-    background_image = f"url('{bg_url}') center / cover no-repeat," if bg_url else ""
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Payment successful!</title>
-  <style>
-    :root {{ color-scheme: dark; }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      font-family: Arial, Helvetica, sans-serif;
-      color: #fff;
-      text-align: center;
-      background:
-        linear-gradient(rgba(3, 8, 20, 0.58), rgba(3, 8, 20, 0.72)),
-        {background_image}
-        #06152f;
-    }}
-    main {{ width: min(680px, calc(100vw - 40px)); padding: 56px 20px; }}
-    .ball {{ font-size: 54px; line-height: 1; margin-bottom: 26px; }}
-    h1 {{ margin: 0 0 18px; font-size: clamp(34px, 6vw, 56px); font-weight: 800; letter-spacing: 0; }}
-    p {{ margin: 10px auto 0; max-width: 560px; font-size: clamp(18px, 2.4vw, 22px); line-height: 1.5; color: rgba(238, 246, 255, 0.94); }}
-    button {{
-      margin-top: 38px;
-      border: 0;
-      border-radius: 10px;
-      padding: 17px 30px;
-      min-width: min(360px, 100%);
-      background: #19b85a;
-      color: #fff;
-      font-size: 20px;
-      font-weight: 800;
-      cursor: pointer;
-      box-shadow: 0 12px 26px rgba(0, 0, 0, 0.30);
-    }}
-    button:active {{ transform: translateY(1px); }}
-    #closeHint {{ display: none; margin-top: 18px; font-size: 17px; color: rgba(238, 246, 255, 0.86); }}
-  </style>
-</head>
-<body>
-  <main>
-    <div class="ball" aria-hidden="true">🏀</div>
-    <h1>Payment successful!</h1>
-    <p>Your purchase has been confirmed.</p>
-    <p>Your Club Tokens are being synchronized.</p>
-    <button type="button" onclick="window.close(); setTimeout(function(){{ document.getElementById('closeHint').style.display='block'; }}, 250);">Return to Basket Manager</button>
-    <div id="closeHint">Return to your Basket Manager tab.</div>
-  </main>
-</body>
-</html>"""
-    return Response(content=html, media_type="text/html; charset=utf-8")
-
-
-@app.get("/payment/cancel")
-def payment_cancel():
-    return _payment_static_page(
-        "Payment cancelled",
-        "No payment was made.<br>You can close this tab and return to Basket Manager.",
-    )
-
 
 @app.get("/debug/resend_env")
 def debug_resend_env():
@@ -474,46 +351,6 @@ _TESTERS_WHITELIST = set([e.strip().lower() for e in (os.environ.get("TESTERS_EM
 # Migration : autoriser l'ancien HMAC (API_SALT_V1) en dev seulement
 ALLOW_HMAC_V1 = (os.environ.get("ALLOW_HMAC_V1", "0") or "0").strip() == "1"
 
-# Stripe Checkout (SAFE 1: infrastructure only, no Token credit)
-STRIPE_SECRET_KEY = (os.environ.get("STRIPE_SECRET_KEY", "") or "").strip()
-STRIPE_PUBLISHABLE_KEY = (os.environ.get("STRIPE_PUBLISHABLE_KEY", "") or "").strip()
-STRIPE_WEBHOOK_SECRET = (os.environ.get("STRIPE_WEBHOOK_SECRET", "") or "").strip()
-PAYMENT_SUCCESS_URL_DEFAULT = "https://api.basketmanager-game.com/payment/success?session_id={CHECKOUT_SESSION_ID}"
-PAYMENT_CANCEL_URL_DEFAULT = "https://api.basketmanager-game.com/payment/cancel"
-
-def _payment_page_url_from_env(name: str, default_url: str, required_path: str) -> str:
-    raw = (os.environ.get(name, "") or "").strip()
-    if raw and required_path in raw and "itch.io" not in raw.lower():
-        return raw
-    return default_url
-
-STRIPE_SUCCESS_URL = _payment_page_url_from_env("STRIPE_SUCCESS_URL", PAYMENT_SUCCESS_URL_DEFAULT, "/payment/success")
-STRIPE_CANCEL_URL = _payment_page_url_from_env("STRIPE_CANCEL_URL", PAYMENT_CANCEL_URL_DEFAULT, "/payment/cancel")
-
-STRIPE_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
-    "starter": {
-        "pack_id": "starter",
-        "stripe_price_id": (os.environ.get("STRIPE_PRICE_STARTER", "") or "").strip(),
-        "tokens": 25,
-        "amount": 99,
-        "currency": "eur",
-    },
-    "club": {
-        "pack_id": "club",
-        "stripe_price_id": (os.environ.get("STRIPE_PRICE_CLUB", "") or "").strip(),
-        "tokens": 75,
-        "amount": 299,
-        "currency": "eur",
-    },
-    "manager": {
-        "pack_id": "manager",
-        "stripe_price_id": (os.environ.get("STRIPE_PRICE_MANAGER", "") or "").strip(),
-        "tokens": 150,
-        "amount": 499,
-        "currency": "eur",
-    },
-}
-
 
 # -------- Helpers (time / hash / jwt) --------
 def _utcnow() -> datetime:
@@ -738,40 +575,6 @@ def _auth_init_schema() -> bool:
               ON cloud_saves_v2 (user_id, profile_uuid);
             """,
             """
-            CREATE TABLE IF NOT EXISTS club_token_wallets (
-              user_id       TEXT NOT NULL REFERENCES users(user_id),
-              profile_uuid  TEXT NOT NULL,
-              tokens        INT NOT NULL DEFAULT 0 CHECK (tokens >= 0),
-              updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              CONSTRAINT club_token_wallets_uq UNIQUE (user_id, profile_uuid)
-            );
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS payments (
-              payment_id               TEXT PRIMARY KEY,
-              user_id                  TEXT NOT NULL REFERENCES users(user_id),
-              profile_uuid             TEXT NOT NULL,
-              provider                 TEXT NOT NULL DEFAULT 'stripe',
-              stripe_session_id        TEXT UNIQUE,
-              stripe_payment_intent_id TEXT UNIQUE,
-              pack_id                  TEXT NOT NULL,
-              amount                   INT NOT NULL,
-              currency                 TEXT NOT NULL,
-              status                   TEXT NOT NULL,
-              credited_at              TIMESTAMPTZ NULL,
-              created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """,
-            """
-            ALTER TABLE payments
-              ADD COLUMN IF NOT EXISTS credited_at TIMESTAMPTZ NULL;
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS payments_user_profile_idx
-              ON payments (user_id, profile_uuid, created_at DESC);
-            """,
-            """
             CREATE TABLE IF NOT EXISTS api_audit (
               id           BIGSERIAL PRIMARY KEY,
               user_id      TEXT NULL,
@@ -824,10 +627,6 @@ class CloudSavePayloadV2(BaseModel):
     blob: Dict[str, Any]
     client_rev: Optional[int] = None
     checksum: Optional[str] = ""
-
-
-class CreateCheckoutSessionPayload(BaseModel):
-    pack_id: str
 
 
 # -------- Auth endpoints (OTP) --------
@@ -1344,33 +1143,6 @@ def lb_season_me(season_id: str, profile_uuid: str, metric: str = "score_final")
 # CLOUD SAVE — V2 (Bearer) + Legacy V1 (HMAC) migration
 # ============================================================
 
-def _club_token_wallet_get_or_create(conn, user_id: str, profile_uuid: str) -> int:
-    conn.execute(text("""
-        INSERT INTO club_token_wallets (user_id, profile_uuid, tokens, updated_at)
-        VALUES (:uid, :p, 0, NOW())
-        ON CONFLICT (user_id, profile_uuid) DO NOTHING;
-    """), {"uid": user_id, "p": profile_uuid})
-
-    row = conn.execute(text("""
-        SELECT tokens
-        FROM club_token_wallets
-        WHERE user_id = :uid AND profile_uuid = :p
-        LIMIT 1;
-    """), {"uid": user_id, "p": profile_uuid}).fetchone()
-
-    return max(0, int(row[0])) if row else 0
-
-
-def _cloud_blob_with_server_tokens(blob: Dict[str, Any], server_tokens: int) -> Dict[str, Any]:
-    clean_blob = copy.deepcopy(blob or {})
-    if not isinstance(clean_blob, dict):
-        clean_blob = {}
-    if not isinstance(clean_blob.get("wallet"), dict):
-        clean_blob["wallet"] = {}
-    clean_blob["wallet"]["tokens"] = max(0, int(server_tokens))
-    return clean_blob
-
-
 def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client_rev: Optional[int], checksum: str) -> Dict[str, Any]:
     if not _auth_init_schema():
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
@@ -1379,6 +1151,11 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
         raise HTTPException(status_code=400, detail="BAD_PROFILE_UUID")
     if not isinstance(blob, dict):
         raise HTTPException(status_code=400, detail="BAD_BLOB")
+
+    blob_json = json.dumps(blob or {}, separators=(",", ":"), ensure_ascii=False)
+    blob_bytes = blob_json.encode("utf-8")
+    if len(blob_bytes) > MAX_BLOB_BYTES:
+        raise HTTPException(status_code=413, detail="BLOB_TOO_LARGE")
 
     eng = _lb_get_engine()
     if eng is None:
@@ -1392,18 +1169,12 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
             LIMIT 1;
         """), {"uid": user_id, "p": profile_uuid}).fetchone()
         server_rev = int(r[0]) if r else 0
-        server_tokens = _club_token_wallet_get_or_create(conn, user_id, profile_uuid)
 
         if client_rev is not None and server_rev and int(client_rev) < server_rev:
             raise HTTPException(status_code=409, detail="REV_CONFLICT")
 
         new_rev = server_rev + 1 if server_rev else 1
         save_id = uuid.uuid4().hex
-        safe_blob = _cloud_blob_with_server_tokens(blob, server_tokens)
-        blob_json = json.dumps(safe_blob, separators=(",", ":"), ensure_ascii=False)
-        blob_bytes = blob_json.encode("utf-8")
-        if len(blob_bytes) > MAX_BLOB_BYTES:
-            raise HTTPException(status_code=413, detail="BLOB_TOO_LARGE")
 
         q = text("""
             INSERT INTO cloud_saves_v2 (save_id, user_id, profile_uuid, rev, checksum, blob_json, blob_size, updated_at)
@@ -1442,7 +1213,6 @@ def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
     with eng.begin() as conn:
-        server_tokens = _club_token_wallet_get_or_create(conn, user_id, profile_uuid)
         r = conn.execute(text("""
             SELECT blob_json, rev, checksum, updated_at
             FROM cloud_saves_v2
@@ -1453,13 +1223,11 @@ def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
     if not r:
         return {"ok": True, "profile_uuid": profile_uuid, "found": False, "blob": None}
 
-    safe_blob = _cloud_blob_with_server_tokens(r[0] if isinstance(r[0], dict) else {}, server_tokens)
-
     return {
         "ok": True,
         "profile_uuid": profile_uuid,
         "found": True,
-        "blob": safe_blob,
+        "blob": r[0],
         "rev": int(r[1]),
         "checksum": r[2] or "",
         "updated_at": str(r[3]),
@@ -1534,527 +1302,6 @@ def _cloud_v1_load(profile_uuid: str) -> Dict[str, Any]:
         return {"ok": True, "profile_uuid": profile_uuid, "found": False, "blob": None}
 
     return {"ok": True, "profile_uuid": profile_uuid, "found": True, "blob": r[0], "updated_at": str(r[1])}
-
-
-
-def _funnel_log(event_name: str, profile_uuid: Optional[str] = "", team_name: Optional[str] = "", ip: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> None:
-    try:
-        eng = _lb_get_engine()
-        if eng is None:
-            return
-        meta_json = json.dumps(meta or {}, separators=(",", ":"))
-        with eng.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS funnel_events (
-                  id BIGSERIAL PRIMARY KEY,
-                  profile_uuid TEXT NULL,
-                  event_name TEXT NOT NULL,
-                  team_name TEXT NULL,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                  ip TEXT NULL
-                );
-            """))
-            conn.execute(text("""
-                ALTER TABLE funnel_events
-                ADD COLUMN IF NOT EXISTS meta_json JSONB NOT NULL DEFAULT '{}'::jsonb;
-            """))
-            conn.execute(text("""
-                INSERT INTO funnel_events (profile_uuid, event_name, team_name, ip, meta_json)
-                VALUES (:profile_uuid, :event_name, :team_name, :ip, CAST(:meta_json AS JSONB));
-            """), {
-                "profile_uuid": (profile_uuid or "").strip() or None,
-                "event_name": event_name,
-                "team_name": (team_name or "").strip() or None,
-                "ip": ip,
-                "meta_json": meta_json
-            })
-    except Exception:
-        pass
-
-
-class FunnelTeamNamePayload(BaseModel):
-    profile_uuid: Optional[str] = ""
-    team_name: Optional[str] = ""
-    meta: Optional[Dict[str, Any]] = None
-
-
-@app.post("/v1/funnel/team-name-created")
-def funnel_team_name_created(p: FunnelTeamNamePayload, request: Request):
-    ip = request.client.host if request.client else None
-    user_id = (p.profile_uuid or "").strip() or None
-    _audit("/v1/funnel/team-name-created", 200, user_id=user_id, ip=ip)
-    _funnel_log("team-name-created", user_id, p.team_name or "", ip, p.meta)
-    return {"ok": True}
-
-class FunnelProfilePayload(BaseModel):
-    profile_uuid: Optional[str] = ""
-
-
-@app.post("/v1/funnel/selection-validated")
-def funnel_selection_validated(p: FunnelProfilePayload, request: Request):
-    ip = request.client.host if request.client else None
-    user_id = (p.profile_uuid or "").strip() or None
-    _audit("/v1/funnel/selection-validated", 200, user_id=user_id, ip=ip)
-    _funnel_log("selection-validated", user_id, "", ip)
-    return {"ok": True}
-
-
-@app.post("/v1/funnel/first-match-started")
-def funnel_first_match_started(p: FunnelProfilePayload, request: Request):
-    ip = request.client.host if request.client else None
-    user_id = (p.profile_uuid or "").strip() or None
-    _audit("/v1/funnel/first-match-started", 200, user_id=user_id, ip=ip)
-    _funnel_log("first-match-started", user_id, "", ip)
-    return {"ok": True}
-
-
-@app.post("/v1/funnel/first-match-finished")
-def funnel_first_match_finished(p: FunnelProfilePayload, request: Request):
-    ip = request.client.host if request.client else None
-    user_id = (p.profile_uuid or "").strip() or None
-    _audit("/v1/funnel/first-match-finished", 200, user_id=user_id, ip=ip)
-    _funnel_log("first-match-finished", user_id, "", ip)
-    return {"ok": True}
-
-
-FUNNEL_GENERIC_EVENTS = (
-    "second-match-started",
-    "eleventh-match-started",
-    "season-finished",
-    "season2-started",
-    "season2-match10",
-)
-
-
-class FunnelEventPayload(BaseModel):
-    profile_uuid: Optional[str] = ""
-    event_name: str
-    team_name: Optional[str] = ""
-    meta: Optional[Dict[str, Any]] = None
-
-
-def _funnel_log_generic(p: FunnelEventPayload, ip: Optional[str]) -> bool:
-    eng = _lb_get_engine()
-    if eng is None:
-        raise HTTPException(status_code=503, detail="DB_NOT_READY")
-
-    meta_json = json.dumps(p.meta or {}, separators=(",", ":"))
-    with eng.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS funnel_events (
-              id BIGSERIAL PRIMARY KEY,
-              profile_uuid TEXT NULL,
-              event_name TEXT NOT NULL,
-              team_name TEXT NULL,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              ip TEXT NULL
-            );
-        """))
-        conn.execute(text("""
-            ALTER TABLE funnel_events
-            ADD COLUMN IF NOT EXISTS meta_json JSONB NOT NULL DEFAULT '{}'::jsonb;
-        """))
-        conn.execute(text("""
-            CREATE UNIQUE INDEX IF NOT EXISTS funnel_events_unique_generic_milestone
-            ON funnel_events (profile_uuid, event_name)
-            WHERE profile_uuid IS NOT NULL
-              AND event_name IN (
-                'second-match-started',
-                'eleventh-match-started',
-                'season-finished',
-                'season2-started',
-                'season2-match10'
-              );
-        """))
-        result = conn.execute(text("""
-            INSERT INTO funnel_events (profile_uuid, event_name, team_name, ip, meta_json)
-            VALUES (:profile_uuid, :event_name, :team_name, :ip, CAST(:meta_json AS JSONB))
-            ON CONFLICT DO NOTHING;
-        """), {
-            "profile_uuid": p.profile_uuid.strip(),
-            "event_name": p.event_name,
-            "team_name": (p.team_name or "").strip() or None,
-            "ip": ip,
-            "meta_json": meta_json,
-        })
-    return bool(result.rowcount)
-
-
-@app.post("/v1/funnel/event")
-def funnel_event(p: FunnelEventPayload, request: Request):
-    profile_uuid = (p.profile_uuid or "").strip()
-    event_name = (p.event_name or "").strip()
-    if not profile_uuid:
-        raise HTTPException(status_code=400, detail="MISSING_PROFILE_UUID")
-    if event_name not in FUNNEL_GENERIC_EVENTS:
-        raise HTTPException(status_code=400, detail="INVALID_EVENT_NAME")
-    if len(json.dumps(p.meta or {})) > 4096:
-        raise HTTPException(status_code=400, detail="META_TOO_LARGE")
-
-    p.profile_uuid = profile_uuid
-    p.event_name = event_name
-    ip = request.client.host if request.client else None
-    _audit("/v1/funnel/event", 200, user_id=profile_uuid, ip=ip)
-    inserted = _funnel_log_generic(p, ip)
-    return {"ok": True, "inserted": inserted}
-
-
-@app.get("/v1/funnel")
-def funnel_stats():
-
-    eng = _lb_get_engine()
-    if eng is None:
-        raise HTTPException(status_code=503, detail="DB_NOT_READY")
-
-    events = [
-        "/v1/funnel/team-name-created",
-        "/v1/funnel/selection-validated",
-        "/v1/funnel/first-match-started",
-        "/v1/funnel/first-match-finished",
-    ]
-
-    out = {}
-
-    with eng.begin() as conn:
-        for event_name in events:
-            row = conn.execute(
-                text("""
-                    SELECT COUNT(DISTINCT user_id)
-                    FROM api_audit
-                    WHERE endpoint = :endpoint
-                """),
-                {"endpoint": event_name}
-            ).fetchone()
-
-            out[event_name.split("/")[-1]] = int(row[0] or 0)
-
-        for event_name in FUNNEL_GENERIC_EVENTS:
-            row = conn.execute(
-                text("""
-                    SELECT COUNT(DISTINCT profile_uuid)
-                    FROM funnel_events
-                    WHERE event_name = :event_name
-                      AND profile_uuid IS NOT NULL
-                """),
-                {"event_name": event_name}
-            ).fetchone()
-            out[event_name] = int(row[0] or 0)
-
-    team = int(out.get("team-name-created", 0))
-    selection = int(out.get("selection-validated", 0))
-    started = int(out.get("first-match-started", 0))
-    finished = int(out.get("first-match-finished", 0))
-
-    conversion = {
-        "team_to_selection": round((selection / team) * 100.0, 1) if team > 0 else 0.0,
-        "selection_to_match": round((started / selection) * 100.0, 1) if selection > 0 else 0.0,
-        "match_to_finish": round((finished / started) * 100.0, 1) if started > 0 else 0.0,
-    }
-
-    return {
-        "ok": True,
-        "funnel": out,
-        "conversion": conversion
-    }
-
-@app.get("/v1/funnel/table")
-def funnel_table(limit: int = 100):
-    eng = _lb_get_engine()
-    if eng is None:
-        raise HTTPException(status_code=503, detail="DB_NOT_READY")
-
-    with eng.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS funnel_events (
-              id BIGSERIAL PRIMARY KEY,
-              profile_uuid TEXT NULL,
-              event_name TEXT NOT NULL,
-              team_name TEXT NULL,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              ip TEXT NULL
-            );
-        """))
-
-        rows = conn.execute(text("""
-            SELECT
-              profile_uuid,
-              MAX(team_name) FILTER (WHERE team_name IS NOT NULL) AS team_name,
-              MIN(created_at) FILTER (WHERE event_name = 'team-name-created') AS team_name_created_at,
-              MIN(created_at) FILTER (WHERE event_name = 'selection-validated') AS selection_validated_at,
-              MIN(created_at) FILTER (WHERE event_name = 'first-match-started') AS first_match_started_at,
-              MIN(created_at) FILTER (WHERE event_name = 'first-match-finished') AS first_match_finished_at,
-              MIN(created_at) FILTER (WHERE event_name = 'second-match-started') AS second_match_started_at,
-              MIN(created_at) FILTER (WHERE event_name = 'eleventh-match-started') AS eleventh_match_started_at,
-              MIN(created_at) FILTER (WHERE event_name = 'season-finished') AS season_finished_at,
-              MIN(created_at) FILTER (WHERE event_name = 'season2-started') AS season2_started_at,
-              MIN(created_at) FILTER (WHERE event_name = 'season2-match10') AS season2_match10_at
-            FROM funnel_events
-            WHERE profile_uuid IS NOT NULL
-            GROUP BY profile_uuid
-            ORDER BY COALESCE(
-              MIN(created_at) FILTER (WHERE event_name = 'team-name-created'),
-              MIN(created_at)
-            ) DESC
-            LIMIT :limit;
-        """), {"limit": max(1, min(int(limit), 500))}).fetchall()
-
-    items = []
-    for r in rows:
-        items.append({
-            "profile_uuid": r[0],
-            "team_name": r[1],
-            "team_name_created_at": str(r[2]) if r[2] else None,
-            "selection_validated_at": str(r[3]) if r[3] else None,
-            "first_match_started_at": str(r[4]) if r[4] else None,
-            "first_match_finished_at": str(r[5]) if r[5] else None,
-            "second_match_started_at": str(r[6]) if r[6] else None,
-            "eleventh_match_started_at": str(r[7]) if r[7] else None,
-            "season_finished_at": str(r[8]) if r[8] else None,
-            "season2_started_at": str(r[9]) if r[9] else None,
-            "season2_match10_at": str(r[10]) if r[10] else None,
-        })
-
-    return {"ok": True, "items": items}
-
-
-
-# ============================================================
-# PAYMENTS - Stripe Checkout (SAFE 1: no Token credit)
-# ============================================================
-
-def _stripe_require_config() -> None:
-    if stripe_sdk is None:
-        raise HTTPException(status_code=503, detail="STRIPE_SDK_NOT_AVAILABLE")
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=503, detail="STRIPE_SECRET_KEY_NOT_CONFIGURED")
-    stripe_sdk.api_key = STRIPE_SECRET_KEY
-
-
-def _stripe_get_pack(pack_id: str) -> Dict[str, Any]:
-    pid = (pack_id or "").strip().lower()
-    pack = STRIPE_TOKEN_PACKS.get(pid)
-    if not pack:
-        raise HTTPException(status_code=400, detail="UNKNOWN_PACK")
-    if not str(pack.get("stripe_price_id", "")).strip():
-        raise HTTPException(status_code=503, detail="STRIPE_PRICE_NOT_CONFIGURED")
-    return pack
-
-
-def _payment_profile_uuid_from_claims(claims: Dict[str, Any]) -> str:
-    # SAFE 1: the client sends only pack_id. Guest auth already uses user_id as profile_uuid.
-    return str(claims.get("sub") or "")
-
-
-def _payment_upsert_checkout_session(conn, *, payment_id: str, user_id: str, profile_uuid: str,
-                                     session_id: str, payment_intent_id: str, pack: Dict[str, Any],
-                                     status: str) -> None:
-    conn.execute(text("""
-        INSERT INTO payments (
-          payment_id, user_id, profile_uuid, provider, stripe_session_id, stripe_payment_intent_id,
-          pack_id, amount, currency, status, created_at, updated_at
-        ) VALUES (
-          :payment_id, :user_id, :profile_uuid, 'stripe', :stripe_session_id, :stripe_payment_intent_id,
-          :pack_id, :amount, :currency, :status, NOW(), NOW()
-        )
-        ON CONFLICT (stripe_session_id)
-        DO UPDATE SET
-          stripe_payment_intent_id = COALESCE(EXCLUDED.stripe_payment_intent_id, payments.stripe_payment_intent_id),
-          status = CASE
-            WHEN payments.credited_at IS NOT NULL THEN payments.status
-            ELSE EXCLUDED.status
-          END,
-          updated_at = NOW();
-    """), {
-        "payment_id": payment_id,
-        "user_id": user_id,
-        "profile_uuid": profile_uuid,
-        "stripe_session_id": session_id,
-        "stripe_payment_intent_id": payment_intent_id or None,
-        "pack_id": str(pack.get("pack_id", "")),
-        "amount": int(pack.get("amount", 0)),
-        "currency": str(pack.get("currency", "eur")),
-        "status": status,
-    })
-
-
-def _payment_credit_tokens_once(conn, *, stripe_session_id: str, user_id: str, profile_uuid: str, tokens: int) -> bool:
-    if not stripe_session_id or not user_id or not profile_uuid or int(tokens) <= 0:
-        return False
-
-    row = conn.execute(text("""
-        SELECT status, credited_at
-        FROM payments
-        WHERE stripe_session_id = :stripe_session_id
-        LIMIT 1
-        FOR UPDATE;
-    """), {"stripe_session_id": stripe_session_id}).fetchone()
-
-    if not row:
-        return False
-    if row[1] is not None or str(row[0] or "") == "credited":
-        return False
-
-    conn.execute(text("""
-        INSERT INTO club_token_wallets (user_id, profile_uuid, tokens, updated_at)
-        VALUES (:user_id, :profile_uuid, 0, NOW())
-        ON CONFLICT (user_id, profile_uuid) DO NOTHING;
-    """), {"user_id": user_id, "profile_uuid": profile_uuid})
-
-    conn.execute(text("""
-        UPDATE club_token_wallets
-        SET tokens = tokens + :tokens,
-            updated_at = NOW()
-        WHERE user_id = :user_id AND profile_uuid = :profile_uuid;
-    """), {"user_id": user_id, "profile_uuid": profile_uuid, "tokens": int(tokens)})
-
-    conn.execute(text("""
-        UPDATE payments
-        SET status = 'credited',
-            credited_at = NOW(),
-            updated_at = NOW()
-        WHERE stripe_session_id = :stripe_session_id;
-    """), {"stripe_session_id": stripe_session_id})
-
-    return True
-
-
-@app.post("/v1/payments/create_checkout_session")
-def create_checkout_session(p: CreateCheckoutSessionPayload, request: Request, authorization: str = Header(default="")):
-    claims = _require_bearer_claims(authorization)
-    user_id = str(claims.get("sub") or "")
-    profile_uuid = _payment_profile_uuid_from_claims(claims)
-
-    _rl_global(user_id)
-    _stripe_require_config()
-    pack = _stripe_get_pack(p.pack_id)
-
-    eng = _lb_get_engine()
-    if eng is None:
-        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
-    if not _auth_init_schema():
-        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
-
-    try:
-        session = stripe_sdk.checkout.Session.create(
-            mode="payment",
-            line_items=[{"price": str(pack["stripe_price_id"]), "quantity": 1}],
-            success_url=STRIPE_SUCCESS_URL,
-            cancel_url=STRIPE_CANCEL_URL,
-            client_reference_id=user_id,
-            metadata={
-                "user_id": user_id,
-                "profile_uuid": profile_uuid,
-                "pack_id": str(pack["pack_id"]),
-                "tokens": str(int(pack["tokens"])),
-            },
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"STRIPE_CHECKOUT_CREATE_FAILED:{type(e).__name__}")
-
-    session_id = str(getattr(session, "id", "") or session.get("id", ""))
-    checkout_url = str(getattr(session, "url", "") or session.get("url", ""))
-    if not session_id or not checkout_url:
-        raise HTTPException(status_code=502, detail="STRIPE_CHECKOUT_BAD_RESPONSE")
-
-    with eng.begin() as conn:
-        _payment_upsert_checkout_session(
-            conn,
-            payment_id=uuid.uuid4().hex,
-            user_id=user_id,
-            profile_uuid=profile_uuid,
-            session_id=session_id,
-            payment_intent_id="",
-            pack=pack,
-            status="checkout_created",
-        )
-
-    ip = request.client.host if request.client else None
-    _audit("/v1/payments/create_checkout_session", 200, user_id=user_id, ip=ip)
-    return {"ok": True, "url": checkout_url}
-
-
-@app.post("/v1/payments/stripe/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(default="", alias="Stripe-Signature")):
-    if stripe_sdk is None:
-        raise HTTPException(status_code=503, detail="STRIPE_SDK_NOT_AVAILABLE")
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=503, detail="STRIPE_WEBHOOK_SECRET_NOT_CONFIGURED")
-
-    payload = await request.body()
-    try:
-        event = stripe_sdk.Webhook.construct_event(payload, stripe_signature, STRIPE_WEBHOOK_SECRET)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="INVALID_WEBHOOK_PAYLOAD")
-    except Exception:
-        raise HTTPException(status_code=400, detail="INVALID_WEBHOOK_SIGNATURE")
-
-    event_type = str(event.get("type", ""))
-    if event_type not in {
-        "checkout.session.completed",
-        "checkout.session.async_payment_succeeded",
-        "checkout.session.async_payment_failed",
-        "checkout.session.expired",
-    }:
-        return {"ok": True, "ignored": event_type}
-
-    session = event.get("data", {}).get("object", {})
-    session_id = str(session.get("id", "") or "")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="MISSING_STRIPE_SESSION_ID")
-
-    metadata = session.get("metadata") or {}
-    pack_id = str(metadata.get("pack_id", "")).strip().lower()
-    pack = STRIPE_TOKEN_PACKS.get(pack_id)
-    if not pack:
-        raise HTTPException(status_code=400, detail="UNKNOWN_PACK")
-
-    user_id = str(metadata.get("user_id", "") or session.get("client_reference_id", "")).strip()
-    profile_uuid = str(metadata.get("profile_uuid", "") or user_id).strip()
-    if not user_id or not profile_uuid:
-        raise HTTPException(status_code=400, detail="MISSING_PAYMENT_OWNER")
-
-    payment_status = str(session.get("payment_status", "") or "")
-    status = "webhook_received"
-    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
-        status = "paid" if payment_status in {"", "paid"} else payment_status
-    elif event_type == "checkout.session.async_payment_failed":
-        status = "failed"
-    elif event_type == "checkout.session.expired":
-        status = "expired"
-
-    payment_intent_id = str(session.get("payment_intent", "") or "")
-
-    eng = _lb_get_engine()
-    if eng is None:
-        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
-    if not _auth_init_schema():
-        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
-
-    credited = False
-    with eng.begin() as conn:
-        _payment_upsert_checkout_session(
-            conn,
-            payment_id=uuid.uuid4().hex,
-            user_id=user_id,
-            profile_uuid=profile_uuid,
-            session_id=session_id,
-            payment_intent_id=payment_intent_id,
-            pack=pack,
-            status=status,
-        )
-
-        if event_type == "checkout.session.completed" and payment_status == "paid":
-            credited = _payment_credit_tokens_once(
-                conn,
-                stripe_session_id=session_id,
-                user_id=user_id,
-                profile_uuid=profile_uuid,
-                tokens=int(pack.get("tokens", 0)),
-            )
-            if credited:
-                status = "credited"
-
-    return {"ok": True, "event": event_type, "status": status, "credited": credited}
 
 
 # -------- Routes (public path = V2) --------
