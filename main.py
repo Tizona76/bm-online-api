@@ -1623,6 +1623,9 @@ FUNNEL_GENERIC_EVENTS = (
     "season-finished",
     "season2-started",
     "season2-match10",
+    "tournament-a-played",
+    "tournament-intermediate-played",
+    "tournament-elite-played",
 )
 
 
