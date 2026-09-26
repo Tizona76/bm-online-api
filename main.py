@@ -295,6 +295,12 @@ def health_root():
     return {"ok": True}
 
 
+@app.get("/v2/capabilities")
+def v2_capabilities():
+    """Version the capability response; modern operations remain disabled."""
+    return {"contract_version": 1, "modern": False}
+
+
 # ============================================================
 # LEADERBOARD (Postgres) — V1 saison mensuelle
 # ============================================================
