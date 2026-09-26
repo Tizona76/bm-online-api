@@ -301,6 +301,161 @@ def v2_capabilities():
     return {"contract_version": 1, "modern": False}
 
 
+# Modern lifecycle is opt-in for controlled tests; capabilities stays dormant.
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
+
+_MODERN_CAREER_LIFECYCLE_ENABLED = (
+    os.environ.get("ENABLE_MODERN_CAREER_LIFECYCLE", "") == "true"
+)
+_MODERN_GENERATION_MAX = 9223372036854775807
+_MODERN_CAREER_COLUMNS = "career_id, profile_uuid, generation, state"
+
+
+def _modern_career_user(request: Request) -> str:
+    if not _MODERN_CAREER_LIFECYCLE_ENABLED:
+        raise HTTPException(status_code=503, detail="MODERN_DISABLED")
+    claims = _require_bearer_claims(request.headers.get("authorization", ""))
+    user_id = claims.get("sub")
+    if not isinstance(user_id, str) or not user_id or user_id != user_id.strip():
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+    return user_id
+
+
+def _modern_career_uuid(value: Any, detail: str) -> str:
+    try:
+        if not isinstance(value, str):
+            raise ValueError()
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=detail)
+
+
+async def _modern_career_body(request: Request, field: str) -> Any:
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="BAD_BODY")
+    if not isinstance(body, dict) or set(body) != {field}:
+        raise HTTPException(status_code=400, detail="BAD_BODY")
+    return body[field]
+
+
+def _modern_career_execute(operation: str, user_id: str, profile_uuid: str,
+                           career_id: str, expected_generation: Optional[int]):
+    # Dedicated connection/transaction: no legacy engine, schema init or audit.
+    db_url = (os.environ.get("DATABASE_URL", "") or "").strip()
+    if not db_url:
+        raise HTTPException(status_code=503, detail="MODERN_STORAGE_UNAVAILABLE")
+    if db_url.startswith(("postgresql://", "postgres://")):
+        db_url = "postgresql+psycopg://" + db_url.split("://", 1)[1]
+    engine = None
+    params = {"user_id": user_id, "profile_uuid": profile_uuid,
+              "career_id": career_id, "generation": expected_generation}
+    owner = "career_id=:career_id AND user_id=:user_id AND profile_uuid=:profile_uuid"
+    try:
+        engine = create_engine(db_url, future=True, connect_args={"sslmode": "require"})
+        with engine.begin() as conn:
+            row = None
+            if operation == "create":
+                row = conn.execute(text(f"""
+                    INSERT INTO public.modern_careers (user_id, profile_uuid, career_id)
+                    VALUES (:user_id, :profile_uuid, :career_id)
+                    ON CONFLICT (career_id) DO NOTHING
+                    RETURNING {_MODERN_CAREER_COLUMNS}
+                """), params).mappings().first()
+                if row is not None:
+                    return dict(row), 201
+            elif operation == "delete":
+                row = conn.execute(text(f"""
+                    UPDATE public.modern_careers
+                    SET state='DELETED', deleted_at=NOW(), updated_at=NOW()
+                    WHERE {owner} AND state='ACTIVE' AND generation=:generation
+                    RETURNING {_MODERN_CAREER_COLUMNS}
+                """), params).mappings().first()
+            elif operation == "restore":
+                row = conn.execute(text(f"""
+                    UPDATE public.modern_careers
+                    SET state='ACTIVE', generation=generation+1,
+                        deleted_at=NULL, updated_at=NOW()
+                    WHERE {owner} AND state='DELETED' AND generation=:generation
+                      AND generation < {_MODERN_GENERATION_MAX}
+                    RETURNING {_MODERN_CAREER_COLUMNS}
+                """), params).mappings().first()
+            if row is not None:
+                return dict(row), 200
+            # One owner-scoped diagnostic read; lock no-op decisions until commit.
+            lock = "" if operation == "read" else " FOR UPDATE"
+            row = conn.execute(text(
+                f"SELECT {_MODERN_CAREER_COLUMNS} FROM public.modern_careers "
+                f"WHERE {owner}{lock}"
+            ), params).mappings().first()
+            if row is None:
+                raise HTTPException(status_code=404, detail="CAREER_NOT_FOUND")
+            if operation == "read":
+                return dict(row), 200
+            if operation == "create":
+                if row["state"] == "DELETED":
+                    raise HTTPException(status_code=409, detail="CAREER_DELETED")
+                return dict(row), 200
+            if row["generation"] != expected_generation:
+                raise HTTPException(status_code=409, detail="GENERATION_MISMATCH")
+            if operation == "delete" and row["state"] == "DELETED":
+                return dict(row), 200
+            if operation == "restore" and row["state"] == "DELETED":
+                detail = "GENERATION_EXHAUSTED" if row["generation"] == _MODERN_GENERATION_MAX else "CAREER_STATE_CONFLICT"
+                raise HTTPException(status_code=409, detail=detail)
+            raise HTTPException(status_code=409, detail="CAREER_ACTIVE")
+    except SQLAlchemyError as exc:
+        code = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        detail = "MODERN_SCHEMA_NOT_READY" if code in {"42P01", "42703"} else "MODERN_STORAGE_UNAVAILABLE"
+        raise HTTPException(status_code=503, detail=detail) from None
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
+async def _modern_career_request(request: Request, profile_uuid: str,
+                                 career_id: Optional[str], operation: str):
+    user_id = _modern_career_user(request)
+    profile_uuid = _modern_career_uuid(profile_uuid, "BAD_PROFILE_ID")
+    expected_generation = None
+    if operation == "create":
+        career_id = await _modern_career_body(request, "career_id")
+    career_id = _modern_career_uuid(career_id, "BAD_CAREER_ID")
+    if operation in {"delete", "restore"}:
+        expected_generation = await _modern_career_body(request, "expected_generation")
+        if type(expected_generation) is not int or not 1 <= expected_generation <= _MODERN_GENERATION_MAX:
+            raise HTTPException(status_code=400, detail="BAD_GENERATION")
+    row, status = await run_in_threadpool(
+        _modern_career_execute, operation, user_id, profile_uuid,
+        career_id, expected_generation
+    )
+    body = {"career_id": str(row["career_id"]), "profile_uuid": str(row["profile_uuid"]),
+            "generation": row["generation"], "state": row["state"]}
+    return Response(content=json.dumps(body), status_code=status, media_type="application/json")
+
+
+@app.post("/v2/profiles/{profile_uuid}/careers")
+async def modern_career_create(profile_uuid: str, request: Request):
+    return await _modern_career_request(request, profile_uuid, None, "create")
+
+
+@app.get("/v2/profiles/{profile_uuid}/careers/{career_id}")
+async def modern_career_read(profile_uuid: str, career_id: str, request: Request):
+    return await _modern_career_request(request, profile_uuid, career_id, "read")
+
+
+@app.delete("/v2/profiles/{profile_uuid}/careers/{career_id}")
+async def modern_career_delete(profile_uuid: str, career_id: str, request: Request):
+    return await _modern_career_request(request, profile_uuid, career_id, "delete")
+
+
+@app.post("/v2/profiles/{profile_uuid}/careers/{career_id}/restore")
+async def modern_career_restore(profile_uuid: str, career_id: str, request: Request):
+    return await _modern_career_request(request, profile_uuid, career_id, "restore")
+
+
 # ============================================================
 # LEADERBOARD (Postgres) — V1 saison mensuelle
 # ============================================================
