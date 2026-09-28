@@ -626,6 +626,12 @@ OTP_START_COOLDOWN_SECONDS = int(os.environ.get("OTP_START_COOLDOWN_SECONDS", "6
 MAX_BLOB_BYTES = int(os.environ.get("MAX_BLOB_BYTES", "262144") or 262144)
 SAVE_COOLDOWN_SECONDS = int(os.environ.get("SAVE_COOLDOWN_SECONDS", "10") or 10)
 
+# Enable only after migration 004 and compatible clients. After any real claim,
+# keep protection enabled: an older writer / flag OFF is NOT a safe rollback.
+ENABLE_LEGACY_CLOUD_CAREER_CLAIM = (
+    os.environ.get("ENABLE_LEGACY_CLOUD_CAREER_CLAIM", "").strip().lower() in ("1", "true")
+)
+
 RL_GLOBAL_PER_MIN = int(os.environ.get("RL_GLOBAL_PER_MIN", "30") or 30)
 RL_SAVE_PER_MIN = int(os.environ.get("RL_SAVE_PER_MIN", "5") or 5)
 
@@ -985,6 +991,8 @@ class CloudSavePayloadV2(BaseModel):
     blob: Dict[str, Any]
     client_rev: Optional[int] = None
     checksum: Optional[str] = ""
+    # Validate only when enabled; OFF must still ignore formerly unknown fields.
+    career_id: Any = None
 
 
 class CreateCheckoutSessionPayload(BaseModel):
@@ -1532,7 +1540,40 @@ def _cloud_blob_with_server_tokens(blob: Dict[str, Any], server_tokens: int) -> 
     return clean_blob
 
 
-def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client_rev: Optional[int], checksum: str) -> Dict[str, Any]:
+def _cloud_claim_check(conn, user_id: str, profile_uuid: str, career_id) -> None:
+    if career_id is not None and (
+        not isinstance(career_id, str) or not 1 <= len(career_id) <= 128
+        or career_id != career_id.strip()
+    ):
+        raise HTTPException(status_code=400, detail="BAD_CAREER_ID")
+
+    # Stable across processes; transaction-scoped and also locks an absent slot.
+    # Hash collisions only serialize unrelated slots, never grant access.
+    slot = json.dumps(["legacy-cloud-claim", user_id, profile_uuid], separators=(",", ":"))
+    lock_key = int.from_bytes(hashlib.sha256(slot.encode()).digest()[:8], "big", signed=True)
+    conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
+    try:
+        row = conn.execute(text("""
+            SELECT career_id FROM cloud_saves_v2
+            WHERE user_id = :uid AND profile_uuid = :p
+        """), {"uid": user_id, "p": profile_uuid}).fetchone()
+    except SQLAlchemyError as exc:
+        if getattr(exc.orig, "sqlstate", None) in ("42703", "42P01"):
+            raise HTTPException(status_code=503, detail="CLOUD_CLAIM_SCHEMA_NOT_READY") from exc
+        raise
+    if row is None:
+        return
+    owner = row[0]
+    if owner is None:
+        if career_id is not None:
+            raise HTTPException(status_code=409, detail="LEGACY_CLOUD_UNCLAIMED")
+    elif career_id is None:
+        raise HTTPException(status_code=409, detail="CAREER_ID_REQUIRED")
+    elif career_id != owner:
+        raise HTTPException(status_code=409, detail="CAREER_CLOUD_CONFLICT")
+
+
+def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client_rev: Optional[int], checksum: str, career_id=None) -> Dict[str, Any]:
     if not _auth_init_schema():
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
@@ -1545,8 +1586,11 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
     if eng is None:
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
-    # conflict / rev
+    # Owner, revision, wallet and blob are checked/written in one transaction.
+    claimed = ENABLE_LEGACY_CLOUD_CAREER_CLAIM and career_id is not None
     with eng.begin() as conn:
+        if ENABLE_LEGACY_CLOUD_CAREER_CLAIM:
+            _cloud_claim_check(conn, user_id, profile_uuid, career_id)
         r = conn.execute(text("""
             SELECT rev FROM cloud_saves_v2
             WHERE user_id = :uid AND profile_uuid = :p
@@ -1566,9 +1610,12 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
         if len(blob_bytes) > MAX_BLOB_BYTES:
             raise HTTPException(status_code=413, detail="BLOB_TOO_LARGE")
 
-        q = text("""
-            INSERT INTO cloud_saves_v2 (save_id, user_id, profile_uuid, rev, checksum, blob_json, blob_size, updated_at)
-            VALUES (:sid, :uid, :p, :rev, :chk, CAST(:blob_json AS jsonb), :sz, NOW())
+        # Owner is inserted with the first blob; an UPDATE never changes it.
+        claim_column = ", career_id" if claimed else ""
+        claim_value = ", :career_id" if claimed else ""
+        q = text(f"""
+            INSERT INTO cloud_saves_v2 (save_id, user_id, profile_uuid, rev, checksum, blob_json, blob_size, updated_at{claim_column})
+            VALUES (:sid, :uid, :p, :rev, :chk, CAST(:blob_json AS jsonb), :sz, NOW(){claim_value})
             ON CONFLICT (user_id, profile_uuid)
             DO UPDATE SET
               rev = EXCLUDED.rev,
@@ -1586,12 +1633,16 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
             "chk": (checksum or "")[:128],
             "blob_json": blob_json,
             "sz": int(len(blob_bytes)),
+            "career_id": career_id if claimed else None,
         }).fetchone()
 
-    return {"ok": True, "profile_uuid": profile_uuid, "rev": int(row[0]) if row else new_rev, "updated_at": str(row[1]) if row else None}
+    result = {"ok": True, "profile_uuid": profile_uuid, "rev": int(row[0]) if row else new_rev, "updated_at": str(row[1]) if row else None}
+    if claimed:
+        result["career_id"] = career_id
+    return result
 
 
-def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
+def _cloud_v2_load(user_id: str, profile_uuid: str, career_id=None) -> Dict[str, Any]:
     if not _auth_init_schema():
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
@@ -1603,6 +1654,8 @@ def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
     with eng.begin() as conn:
+        if ENABLE_LEGACY_CLOUD_CAREER_CLAIM:
+            _cloud_claim_check(conn, user_id, profile_uuid, career_id)
         server_tokens = _club_token_wallet_get_or_create(conn, user_id, profile_uuid)
         r = conn.execute(text("""
             SELECT blob_json, rev, checksum, updated_at
@@ -1616,7 +1669,7 @@ def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
 
     safe_blob = _cloud_blob_with_server_tokens(r[0] if isinstance(r[0], dict) else {}, server_tokens)
 
-    return {
+    result = {
         "ok": True,
         "profile_uuid": profile_uuid,
         "found": True,
@@ -1625,6 +1678,9 @@ def _cloud_v2_load(user_id: str, profile_uuid: str) -> Dict[str, Any]:
         "checksum": r[2] or "",
         "updated_at": str(r[3]),
     }
+    if ENABLE_LEGACY_CLOUD_CAREER_CLAIM and career_id is not None:
+        result["career_id"] = career_id
+    return result
 
 
 # Legacy V1 (HMAC) helpers (kept for migration)
@@ -2241,7 +2297,7 @@ def cloud_save_v2(p: CloudSavePayloadV2, request: Request, authorization: str = 
     ip = request.client.host if request.client else None
 
     try:
-        out = _cloud_v2_save(user_id, p.profile_uuid, p.blob, p.client_rev, p.checksum or "")
+        out = _cloud_v2_save(user_id, p.profile_uuid, p.blob, p.client_rev, p.checksum or "", p.career_id)
         _audit("/v1/cloud/save", 200, user_id=user_id, size=None, ip=ip)
         return out
     except HTTPException as he:
@@ -2250,7 +2306,7 @@ def cloud_save_v2(p: CloudSavePayloadV2, request: Request, authorization: str = 
 
 
 @app.get("/v1/cloud/load")
-def cloud_load_v2(profile_uuid: str, request: Request, authorization: str = Header(default="")):
+def cloud_load_v2(profile_uuid: str, request: Request, authorization: str = Header(default=""), career_id: Optional[str] = None):
     claims = _require_bearer_claims(authorization)
     user_id = str(claims.get("sub") or "")
 
@@ -2258,7 +2314,7 @@ def cloud_load_v2(profile_uuid: str, request: Request, authorization: str = Head
 
     ip = request.client.host if request.client else None
     try:
-        out = _cloud_v2_load(user_id, profile_uuid)
+        out = _cloud_v2_load(user_id, profile_uuid, career_id)
         _audit("/v1/cloud/load", 200, user_id=user_id, ip=ip)
         return out
     except HTTPException as he:
