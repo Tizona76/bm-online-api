@@ -1552,25 +1552,28 @@ def _cloud_claim_check(conn, user_id: str, profile_uuid: str, career_id) -> None
     slot = json.dumps(["legacy-cloud-claim", user_id, profile_uuid], separators=(",", ":"))
     lock_key = int.from_bytes(hashlib.sha256(slot.encode()).digest()[:8], "big", signed=True)
     conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
-    try:
-        row = conn.execute(text("""
-            SELECT career_id FROM cloud_saves_v2
-            WHERE user_id = :uid AND profile_uuid = :p
-        """), {"uid": user_id, "p": profile_uuid}).fetchone()
-    except SQLAlchemyError as exc:
-        if getattr(exc.orig, "sqlstate", None) in ("42703", "42P01"):
-            raise HTTPException(status_code=503, detail="CLOUD_CLAIM_SCHEMA_NOT_READY") from exc
-        raise
-    if row is None:
-        return
-    owner = row[0]
-    if owner is None:
-        if career_id is not None:
+    # Migration 005 is explicit. Never route a career request through the old slot.
+    ready = conn.execute(text("""
+        SELECT pg_get_constraintdef(oid) FROM pg_constraint
+        WHERE conrelid = to_regclass('public.cloud_saves_v2')
+          AND conname = 'cloud_saves_v2_uq' AND contype = 'u'
+          AND NOT condeferrable AND convalidated
+    """)).scalar()
+    if ready != 'UNIQUE NULLS NOT DISTINCT (user_id, profile_uuid, career_id)':
+        raise HTTPException(status_code=503, detail="CLOUD_CLAIM_SCHEMA_NOT_READY")
+    # An existing exact slot is usable. A legacy slot must never be silently
+    # adopted by a new named career. Other named careers do not own this slot.
+    if career_id is not None:
+        unclaimed = conn.execute(text("""
+            SELECT 1 FROM cloud_saves_v2
+            WHERE user_id = :uid AND profile_uuid = :p AND career_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM cloud_saves_v2
+                WHERE user_id = :uid AND profile_uuid = :p AND career_id = :career_id
+              )
+        """), {"uid": user_id, "p": profile_uuid, "career_id": career_id}).fetchone()
+        if unclaimed:
             raise HTTPException(status_code=409, detail="LEGACY_CLOUD_UNCLAIMED")
-    elif career_id is None:
-        raise HTTPException(status_code=409, detail="CAREER_ID_REQUIRED")
-    elif career_id != owner:
-        raise HTTPException(status_code=409, detail="CAREER_CLOUD_CONFLICT")
 
 
 def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client_rev: Optional[int], checksum: str, career_id=None) -> Dict[str, Any]:
@@ -1587,15 +1590,15 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
     # Owner, revision, wallet and blob are checked/written in one transaction.
-    claimed = ENABLE_LEGACY_CLOUD_CAREER_CLAIM and career_id is not None
+    claimed = career_id is not None
     with eng.begin() as conn:
-        if ENABLE_LEGACY_CLOUD_CAREER_CLAIM:
-            _cloud_claim_check(conn, user_id, profile_uuid, career_id)
+        _cloud_claim_check(conn, user_id, profile_uuid, career_id)
         r = conn.execute(text("""
             SELECT rev FROM cloud_saves_v2
             WHERE user_id = :uid AND profile_uuid = :p
+              AND career_id IS NOT DISTINCT FROM :career_id
             LIMIT 1;
-        """), {"uid": user_id, "p": profile_uuid}).fetchone()
+        """), {"uid": user_id, "p": profile_uuid, "career_id": career_id}).fetchone()
         server_rev = int(r[0]) if r else 0
         server_tokens = _club_token_wallet_get_or_create(conn, user_id, profile_uuid)
 
@@ -1611,12 +1614,10 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
             raise HTTPException(status_code=413, detail="BLOB_TOO_LARGE")
 
         # Owner is inserted with the first blob; an UPDATE never changes it.
-        claim_column = ", career_id" if claimed else ""
-        claim_value = ", :career_id" if claimed else ""
-        q = text(f"""
-            INSERT INTO cloud_saves_v2 (save_id, user_id, profile_uuid, rev, checksum, blob_json, blob_size, updated_at{claim_column})
-            VALUES (:sid, :uid, :p, :rev, :chk, CAST(:blob_json AS jsonb), :sz, NOW(){claim_value})
-            ON CONFLICT (user_id, profile_uuid)
+        q = text("""
+            INSERT INTO cloud_saves_v2 (save_id, user_id, profile_uuid, rev, checksum, blob_json, blob_size, updated_at, career_id)
+            VALUES (:sid, :uid, :p, :rev, :chk, CAST(:blob_json AS jsonb), :sz, NOW(), :career_id)
+            ON CONFLICT (user_id, profile_uuid, career_id)
             DO UPDATE SET
               rev = EXCLUDED.rev,
               checksum = EXCLUDED.checksum,
@@ -1633,7 +1634,7 @@ def _cloud_v2_save(user_id: str, profile_uuid: str, blob: Dict[str, Any], client
             "chk": (checksum or "")[:128],
             "blob_json": blob_json,
             "sz": int(len(blob_bytes)),
-            "career_id": career_id if claimed else None,
+            "career_id": career_id,
         }).fetchone()
 
     result = {"ok": True, "profile_uuid": profile_uuid, "rev": int(row[0]) if row else new_rev, "updated_at": str(row[1]) if row else None}
@@ -1654,15 +1655,15 @@ def _cloud_v2_load(user_id: str, profile_uuid: str, career_id=None) -> Dict[str,
         raise HTTPException(status_code=503, detail="CLOUD_DB_NOT_READY")
 
     with eng.begin() as conn:
-        if ENABLE_LEGACY_CLOUD_CAREER_CLAIM:
-            _cloud_claim_check(conn, user_id, profile_uuid, career_id)
+        _cloud_claim_check(conn, user_id, profile_uuid, career_id)
         server_tokens = _club_token_wallet_get_or_create(conn, user_id, profile_uuid)
         r = conn.execute(text("""
             SELECT blob_json, rev, checksum, updated_at
             FROM cloud_saves_v2
             WHERE user_id = :uid AND profile_uuid = :p
+              AND career_id IS NOT DISTINCT FROM :career_id
             LIMIT 1;
-        """), {"uid": user_id, "p": profile_uuid}).fetchone()
+        """), {"uid": user_id, "p": profile_uuid, "career_id": career_id}).fetchone()
 
     if not r:
         return {"ok": True, "profile_uuid": profile_uuid, "found": False, "blob": None}
@@ -1678,7 +1679,7 @@ def _cloud_v2_load(user_id: str, profile_uuid: str, career_id=None) -> Dict[str,
         "checksum": r[2] or "",
         "updated_at": str(r[3]),
     }
-    if ENABLE_LEGACY_CLOUD_CAREER_CLAIM and career_id is not None:
+    if career_id is not None:
         result["career_id"] = career_id
     return result
 
