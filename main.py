@@ -17,6 +17,17 @@ try:
 except Exception:
     stripe_sdk = None
 
+try:
+    from appstoreserverlibrary.models.Environment import Environment as AppleEnvironment
+    from appstoreserverlibrary.signed_data_verifier import (
+        SignedDataVerifier as AppleSignedDataVerifier,
+        VerificationException as AppleVerificationException,
+    )
+except Exception:
+    AppleEnvironment = None
+    AppleSignedDataVerifier = None
+    AppleVerificationException = Exception
+
 
 from datetime import datetime, timedelta, timezone
 
@@ -657,6 +668,26 @@ def _payment_page_url_from_env(name: str, default_url: str, required_path: str) 
 STRIPE_SUCCESS_URL = _payment_page_url_from_env("STRIPE_SUCCESS_URL", PAYMENT_SUCCESS_URL_DEFAULT, "/payment/success")
 STRIPE_CANCEL_URL = _payment_page_url_from_env("STRIPE_CANCEL_URL", PAYMENT_CANCEL_URL_DEFAULT, "/payment/cancel")
 
+APPLE_IAP_BUNDLE_ID = (os.environ.get("APPLE_IAP_BUNDLE_ID", "com.isibosch.basketcorp") or "").strip()
+APPLE_IAP_ENVIRONMENT = (os.environ.get("APPLE_IAP_ENVIRONMENT", "sandbox") or "sandbox").strip().lower()
+APPLE_APP_ID = (os.environ.get("APPLE_APP_ID", "") or "").strip()
+APPLE_ROOT_CERTIFICATES_B64 = (os.environ.get("APPLE_ROOT_CERTIFICATES_B64", "") or "").strip()
+
+APPLE_TOKEN_PRODUCTS: Dict[str, Dict[str, Any]] = {
+    "com.basketcorp.tokens25": {
+        "pack_id": "starter",
+        "tokens": 25,
+    },
+    "com.basketcorp.tokens75": {
+        "pack_id": "club",
+        "tokens": 75,
+    },
+    "com.basketcorp.tokens150": {
+        "pack_id": "manager",
+        "tokens": 150,
+    },
+}
+
 STRIPE_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
     "starter": {
         "pack_id": "starter",
@@ -921,6 +952,9 @@ def _auth_init_schema() -> bool:
               provider                 TEXT NOT NULL DEFAULT 'stripe',
               stripe_session_id        TEXT UNIQUE,
               stripe_payment_intent_id TEXT UNIQUE,
+              apple_transaction_id     TEXT NULL,
+              apple_product_id         TEXT NULL,
+              apple_price_milliunits   BIGINT NULL,
               pack_id                  TEXT NOT NULL,
               amount                   INT NOT NULL,
               currency                 TEXT NOT NULL,
@@ -933,6 +967,23 @@ def _auth_init_schema() -> bool:
             """
             ALTER TABLE payments
               ADD COLUMN IF NOT EXISTS credited_at TIMESTAMPTZ NULL;
+            """,
+            """
+            ALTER TABLE payments
+              ADD COLUMN IF NOT EXISTS apple_transaction_id TEXT NULL;
+            """,
+            """
+            ALTER TABLE payments
+              ADD COLUMN IF NOT EXISTS apple_product_id TEXT NULL;
+            """,
+            """
+            ALTER TABLE payments
+              ADD COLUMN IF NOT EXISTS apple_price_milliunits BIGINT NULL;
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS payments_apple_transaction_id_uq
+              ON payments (apple_transaction_id)
+              WHERE apple_transaction_id IS NOT NULL;
             """,
             """
             CREATE INDEX IF NOT EXISTS payments_user_profile_idx
@@ -997,6 +1048,9 @@ class CloudSavePayloadV2(BaseModel):
 
 class CreateCheckoutSessionPayload(BaseModel):
     pack_id: str
+
+class AppleVerifyPayload(BaseModel):
+    signed_transaction_info: str
 
 
 # -------- Auth endpoints (OTP) --------
@@ -2037,6 +2091,363 @@ def funnel_table(limit: int = 100):
 
     return {"ok": True, "items": items}
 
+
+
+# ============================================================
+# PAYMENTS - Apple StoreKit verification (no Token credit)
+# ============================================================
+
+def _apple_iap_environment():
+    if AppleEnvironment is None:
+        raise HTTPException(status_code=503, detail="APPLE_IAP_LIBRARY_NOT_AVAILABLE")
+
+    if APPLE_IAP_ENVIRONMENT == "sandbox":
+        return AppleEnvironment.SANDBOX
+
+    if APPLE_IAP_ENVIRONMENT == "production":
+        return AppleEnvironment.PRODUCTION
+
+    raise HTTPException(status_code=503, detail="APPLE_IAP_BAD_ENVIRONMENT")
+
+
+def _apple_root_certificates() -> list[bytes]:
+    raw = APPLE_ROOT_CERTIFICATES_B64
+    if not raw:
+        raise HTTPException(status_code=503, detail="APPLE_IAP_ROOT_CERTIFICATES_NOT_CONFIGURED")
+
+    certificates = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            certificates.append(base64.b64decode(item, validate=True))
+        except Exception:
+            raise HTTPException(status_code=503, detail="APPLE_IAP_ROOT_CERTIFICATES_INVALID")
+
+    if not certificates:
+        raise HTTPException(status_code=503, detail="APPLE_IAP_ROOT_CERTIFICATES_NOT_CONFIGURED")
+
+    return certificates
+
+
+def _apple_verify_signed_transaction(signed_transaction_info: str):
+    if AppleSignedDataVerifier is None:
+        raise HTTPException(status_code=503, detail="APPLE_IAP_LIBRARY_NOT_AVAILABLE")
+
+    signed_transaction_info = (signed_transaction_info or "").strip()
+    if not signed_transaction_info:
+        raise HTTPException(status_code=400, detail="MISSING_SIGNED_TRANSACTION_INFO")
+
+    environment = _apple_iap_environment()
+
+    app_apple_id = None
+    if environment == AppleEnvironment.PRODUCTION:
+        try:
+            app_apple_id = int(APPLE_APP_ID)
+        except Exception:
+            raise HTTPException(status_code=503, detail="APPLE_APP_ID_NOT_CONFIGURED")
+
+    try:
+        verifier = AppleSignedDataVerifier(
+            _apple_root_certificates(),
+            True,
+            environment,
+            APPLE_IAP_BUNDLE_ID,
+            app_apple_id,
+        )
+        transaction = verifier.verify_and_decode_signed_transaction(
+            signed_transaction_info
+        )
+    except AppleVerificationException:
+        raise HTTPException(status_code=400, detail="APPLE_TRANSACTION_VERIFICATION_FAILED")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="APPLE_TRANSACTION_VERIFICATION_FAILED")
+
+    transaction_id = str(getattr(transaction, "transactionId", "") or "").strip()
+    product_id = str(getattr(transaction, "productId", "") or "").strip()
+
+    if not transaction_id:
+        raise HTTPException(status_code=400, detail="APPLE_TRANSACTION_ID_MISSING")
+
+    pack = APPLE_TOKEN_PRODUCTS.get(product_id)
+    if not pack:
+        raise HTTPException(status_code=400, detail="UNKNOWN_APPLE_PRODUCT")
+
+    quantity = getattr(transaction, "quantity", None)
+    if quantity != 1:
+        raise HTTPException(status_code=400, detail="APPLE_BAD_QUANTITY")
+
+    if getattr(transaction, "revocationDate", None) is not None:
+        raise HTTPException(status_code=400, detail="APPLE_TRANSACTION_REVOKED")
+
+    price = getattr(transaction, "price", None)
+    if type(price) is not int or price <= 0:
+        raise HTTPException(status_code=400, detail="APPLE_PRICE_MISSING")
+
+    currency = str(getattr(transaction, "currency", "") or "").strip().upper()
+    if len(currency) != 3 or not currency.isalpha():
+        raise HTTPException(status_code=400, detail="APPLE_CURRENCY_MISSING")
+
+    return transaction, transaction_id, product_id, pack, price, currency
+
+
+def _payment_upsert_apple_transaction(
+    conn,
+    *,
+    payment_id: str,
+    user_id: str,
+    profile_uuid: str,
+    transaction_id: str,
+    product_id: str,
+    pack: Dict[str, Any],
+    price_milliunits: int,
+    currency: str,
+) -> None:
+    conn.execute(text("""
+        INSERT INTO payments (
+          payment_id,
+          user_id,
+          profile_uuid,
+          provider,
+          apple_transaction_id,
+          apple_product_id,
+          apple_price_milliunits,
+          pack_id,
+          amount,
+          currency,
+          status,
+          created_at,
+          updated_at
+        ) VALUES (
+          :payment_id,
+          :user_id,
+          :profile_uuid,
+          'apple',
+          :apple_transaction_id,
+          :apple_product_id,
+          :apple_price_milliunits,
+          :pack_id,
+          :amount,
+          :currency,
+          'verified',
+          NOW(),
+          NOW()
+        )
+        ON CONFLICT DO NOTHING;
+    """), {
+        "payment_id": payment_id,
+        "user_id": user_id,
+        "profile_uuid": profile_uuid,
+        "apple_transaction_id": transaction_id,
+        "apple_product_id": product_id,
+        "apple_price_milliunits": int(price_milliunits),
+        "pack_id": str(pack["pack_id"]),
+        "amount": int(price_milliunits),
+        "currency": currency,
+    })
+
+    row = conn.execute(text("""
+        SELECT
+          user_id,
+          profile_uuid,
+          provider,
+          apple_product_id,
+          pack_id
+        FROM payments
+        WHERE apple_transaction_id = :apple_transaction_id
+        LIMIT 1
+        FOR UPDATE;
+    """), {
+        "apple_transaction_id": transaction_id,
+    }).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=503, detail="APPLE_PAYMENT_NOT_PERSISTED")
+
+    if str(row[2] or "") != "apple":
+        raise HTTPException(status_code=409, detail="APPLE_TRANSACTION_PROVIDER_CONFLICT")
+
+    if str(row[0] or "") != user_id or str(row[1] or "") != profile_uuid:
+        raise HTTPException(status_code=409, detail="APPLE_TRANSACTION_OWNER_CONFLICT")
+
+    if (
+        str(row[3] or "") != product_id
+        or str(row[4] or "") != str(pack["pack_id"])
+    ):
+        raise HTTPException(status_code=409, detail="APPLE_TRANSACTION_DATA_CONFLICT")
+
+
+def _payment_credit_apple_tokens_once(
+    conn,
+    *,
+    transaction_id: str,
+    user_id: str,
+    profile_uuid: str,
+    tokens: int,
+):
+    if not transaction_id or not user_id or not profile_uuid or int(tokens) <= 0:
+        raise HTTPException(status_code=400, detail="APPLE_PAYMENT_BAD_CREDIT_INPUT")
+
+    row = conn.execute(text("""
+        SELECT status, credited_at
+        FROM payments
+        WHERE apple_transaction_id = :apple_transaction_id
+          AND provider = 'apple'
+          AND user_id = :user_id
+          AND profile_uuid = :profile_uuid
+        LIMIT 1
+        FOR UPDATE;
+    """), {
+        "apple_transaction_id": transaction_id,
+        "user_id": user_id,
+        "profile_uuid": profile_uuid,
+    }).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=409, detail="APPLE_PAYMENT_OWNER_MISMATCH")
+
+    if row[1] is not None or str(row[0] or "") == "credited":
+        wallet = conn.execute(text("""
+            SELECT tokens
+            FROM club_token_wallets
+            WHERE user_id = :user_id AND profile_uuid = :profile_uuid
+            LIMIT 1;
+        """), {
+            "user_id": user_id,
+            "profile_uuid": profile_uuid,
+        }).fetchone()
+
+        if not wallet:
+            raise HTTPException(
+                status_code=503,
+                detail="APPLE_PAYMENT_WALLET_INCONSISTENT",
+            )
+
+        return False, max(0, int(wallet[0]))
+
+    conn.execute(text("""
+        INSERT INTO club_token_wallets (
+          user_id, profile_uuid, tokens, updated_at
+        )
+        VALUES (:user_id, :profile_uuid, 0, NOW())
+        ON CONFLICT (user_id, profile_uuid) DO NOTHING;
+    """), {
+        "user_id": user_id,
+        "profile_uuid": profile_uuid,
+    })
+
+    wallet = conn.execute(text("""
+        UPDATE club_token_wallets
+        SET tokens = tokens + :tokens,
+            updated_at = NOW()
+        WHERE user_id = :user_id
+          AND profile_uuid = :profile_uuid
+        RETURNING tokens;
+    """), {
+        "user_id": user_id,
+        "profile_uuid": profile_uuid,
+        "tokens": int(tokens),
+    }).fetchone()
+
+    if not wallet:
+        raise HTTPException(status_code=503, detail="APPLE_WALLET_CREDIT_FAILED")
+
+    updated = conn.execute(text("""
+        UPDATE payments
+        SET status = 'credited',
+            credited_at = NOW(),
+            updated_at = NOW()
+        WHERE apple_transaction_id = :apple_transaction_id
+          AND provider = 'apple'
+          AND credited_at IS NULL;
+    """), {
+        "apple_transaction_id": transaction_id,
+    })
+
+    if updated.rowcount != 1:
+        raise HTTPException(status_code=503, detail="APPLE_PAYMENT_CREDIT_MARK_FAILED")
+
+    return True, max(0, int(wallet[0]))
+
+
+@app.post("/v1/payments/apple/verify")
+def apple_verify_transaction(
+    p: AppleVerifyPayload,
+    request: Request,
+    authorization: str = Header(default=""),
+):
+    claims = _require_bearer_claims(authorization)
+    user_id = str(claims.get("sub") or "")
+    profile_uuid = _payment_profile_uuid_from_claims(claims)
+
+    if not user_id or not profile_uuid:
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+
+    _rl_global(user_id)
+
+    (
+        transaction,
+        transaction_id,
+        product_id,
+        pack,
+        price_milliunits,
+        currency,
+    ) = _apple_verify_signed_transaction(p.signed_transaction_info)
+
+    # Check signed ownership before persistence/credit, including replays.
+    try:
+        account_token = uuid.UUID(str(getattr(transaction, "appAccountToken", "") or ""))
+        expected_account = uuid.UUID(user_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=403, detail="APPLE_ACCOUNT_TOKEN_INVALID")
+    if account_token != expected_account:
+        raise HTTPException(status_code=403, detail="APPLE_ACCOUNT_TOKEN_MISMATCH")
+
+    eng = _lb_get_engine()
+    if eng is None:
+        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
+
+    if not _auth_init_schema():
+        raise HTTPException(status_code=503, detail="PAYMENTS_DB_NOT_READY")
+
+    with eng.begin() as conn:
+        _payment_upsert_apple_transaction(
+            conn,
+            payment_id=uuid.uuid4().hex,
+            user_id=user_id,
+            profile_uuid=profile_uuid,
+            transaction_id=transaction_id,
+            product_id=product_id,
+            pack=pack,
+            price_milliunits=price_milliunits,
+            currency=currency,
+        )
+
+        credited_now, balance = _payment_credit_apple_tokens_once(
+            conn,
+            transaction_id=transaction_id,
+            user_id=user_id,
+            profile_uuid=profile_uuid,
+            tokens=int(pack["tokens"]),
+        )
+
+    ip = request.client.host if request.client else None
+    _audit("/v1/payments/apple/verify", 200, user_id=user_id, ip=ip)
+
+    return {
+        "ok": True,
+        "verified": True,
+        "transaction_id": transaction_id,
+        "product_id": product_id,
+        "pack_id": str(pack["pack_id"]),
+        "tokens": int(pack["tokens"]),
+        "credited": True,
+        "credited_now": credited_now,
+        "balance": balance,
+    }
 
 
 # ============================================================
