@@ -2746,3 +2746,83 @@ def cloud_load_v1(profile_uuid: str, request: Request):
     if not ALLOW_HMAC_V1:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
     return _cloud_v1_load(profile_uuid)
+
+
+# Isolated purchase-session authentication; general JWT routes stay unchanged.
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+if __package__:
+    from . import steam_identity as _steam_identity
+else:
+    import steam_identity as _steam_identity
+
+class SteamPurchaseSessionPayload(BaseModel):
+    ticket: str
+
+
+def _steam_purchase_session(ticket: str):
+    if os.environ.get("STEAM_IDENTITY_ENABLED") != "1":
+        raise _steam_identity.Rejected(503, "STEAM_IDENTITY_DISABLED")
+    store = _steam_identity.Store(_lb_get_engine)
+    service = _steam_identity.Service(store, _steam_identity.ValveAdapter(lambda: os.environ.get("STEAM_PUBLISHER_KEY", "")))
+    steam_id = service.verify_ticket({'ticket':ticket})
+    user = store.purchase_user(steam_id)
+    now = int(time.time())
+    claims = {"sub":user,"typ":"steam_purchase","iss":JWT_ISSUER+"/steam-purchases","aud":"steam-purchases",
+              "iat":now,"exp":now+900,"steam_id":steam_id,"app_id":_steam_identity.APP_ID,"service_identity":_steam_identity.IDENTITY}
+    token = jwt.encode(claims, JWT_SECRET, algorithm="HS256")
+    return {"access_token":token,"user_id":user,"token_type":"bearer","expires_in":900}
+
+
+def _steam_require_purchase_bearer(authorization):
+    if not authorization.startswith('Bearer '):
+        raise HTTPException(401, 'MISSING_BEARER')
+    try:
+        claims = jwt.decode(authorization[7:], JWT_SECRET, algorithms=['HS256'],
+                            audience='steam-purchases', issuer=JWT_ISSUER+'/steam-purchases')
+    except JWTError:
+        # Preserve existing linked-account access; the general decoder never accepts
+        # the purchase audience/type. Steam tokens cannot reach general routes.
+        return _require_bearer_claims(authorization)
+    now = time.time()
+    if (claims.get('typ') != 'steam_purchase' or claims.get('app_id') != _steam_identity.APP_ID
+        or claims.get('service_identity') != _steam_identity.IDENTITY
+        or not isinstance(claims.get('sub'),str) or not claims['sub']
+        or not isinstance(claims.get('steam_id'),str)
+        or type(claims.get('iat')) is not int or type(claims.get('exp')) is not int
+        or not claims['iat'] <= now < claims['exp'] or not 0 < claims['exp']-claims['iat'] <= 900):
+        raise HTTPException(401, 'INVALID_SESSION')
+    return claims
+
+
+@app.post("/v1/steam/purchase-session")
+async def steam_purchase_session(p: SteamPurchaseSessionPayload):
+    try:
+        value = await run_in_threadpool(_steam_purchase_session, p.ticket)
+        return JSONResponse(value, headers={"Cache-Control":"no-store"})
+    except _steam_identity.Rejected as exc:
+        return JSONResponse({"detail":exc.code}, status_code=exc.status, headers={"Cache-Control":"no-store"})
+    except Exception:
+        return JSONResponse({"detail":"STEAM_SESSION_UNAVAILABLE"}, status_code=503, headers={"Cache-Control":"no-store"})
+
+# Steam identity is optional and performs no startup database/network operations.
+if __package__:
+    from .steam_identity import create_router as _steam_identity_router
+else:
+    from steam_identity import create_router as _steam_identity_router
+app.include_router(_steam_identity_router(_lb_get_engine, _require_bearer_claims))
+
+
+# A5 wallet: independent opt-in, with isolated Steam purchase sessions.
+if __package__:
+    from .steam_wallet import create_router as _steam_wallet_router
+else:
+    from steam_wallet import create_router as _steam_wallet_router
+app.include_router(_steam_wallet_router(_lb_get_engine, _steam_require_purchase_bearer, purchase_sessions=True))
+
+# A4 remains disabled by default; no startup network or database access.
+if __package__:
+    from .steam_payments import create_router as _steam_payments_router
+else:
+    from steam_payments import create_router as _steam_payments_router
+app.include_router(_steam_payments_router(_lb_get_engine, _steam_require_purchase_bearer, purchase_sessions=True))
