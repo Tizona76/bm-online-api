@@ -2450,6 +2450,13 @@ def apple_verify_transaction(
     }
 
 
+# V1 opt-in intention contract; legacy Apple verifier above remains unchanged.
+from apple_purchase_v1 import register as _register_apple_purchase_v1
+_register_apple_purchase_v1(app, _require_bearer_claims, _lb_get_engine,
+    _apple_verify_signed_transaction, APPLE_TOKEN_PRODUCTS,
+    _payment_upsert_apple_transaction, _payment_credit_apple_tokens_once)
+
+
 # ============================================================
 # PAYMENTS - Stripe Checkout (SAFE 1: no Token credit)
 # ============================================================
